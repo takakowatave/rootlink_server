@@ -14,7 +14,6 @@ app.post("/chat", async (c) => {
   const prompt = `
 次の英単語「${message}」について、日本語で以下の形式の**JSON文字列のみ**を返してください。
 装飾や説明文、バッククォートなどは含めないでください。
-"partOfSpeech" は必ず "pos" をキー名として使用し、配列 ["noun"] のような形式で出力してください。
 
 {
   "main": {
@@ -74,10 +73,30 @@ app.post("/chat", async (c) => {
 
     // ✅ フロントが期待する形式で返す
     return c.json({
-      main: parsed.main || parsed,
-      synonyms: parsed.synonyms,
-      antonyms: parsed.antonyms,
+      main: {
+        ...parsed.main,
+        partOfSpeech: Array.isArray(parsed.main.partOfSpeech)
+          ? parsed.main.partOfSpeech
+          : [parsed.main.partOfSpeech],
+      },
+      synonyms: parsed.synonyms
+        ? {
+            ...parsed.synonyms,
+            partOfSpeech: Array.isArray(parsed.synonyms.partOfSpeech)
+              ? parsed.synonyms.partOfSpeech
+              : [parsed.synonyms.partOfSpeech],
+          }
+        : undefined,
+      antonyms: parsed.antonyms
+        ? {
+            ...parsed.antonyms,
+            partOfSpeech: Array.isArray(parsed.antonyms.partOfSpeech)
+              ? parsed.antonyms.partOfSpeech
+              : [parsed.antonyms.partOfSpeech],
+          }
+        : undefined,
     });
+
   } catch (err) {
     console.error("🔥 OpenAI fetch error:", err);
     return c.json({ error: "OpenAI fetch failed" });
@@ -88,3 +107,4 @@ const port = Number(process.env.PORT) || 8080;
 console.log(`🚀 Server running on port ${port}`);
 
 serve({ fetch: app.fetch, port });
+
