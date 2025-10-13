@@ -11,7 +11,7 @@ app.get("/", (c) => c.text("Hono server is running!"));
 app.post("/chat", async (c) => {
   const { message } = await c.req.json();
 
-  const prompt = `
+const prompt = `
 次の英単語「${message}」について、日本語で以下の形式の**JSON文字列のみ**を返してください。
 装飾や説明文、バッククォートなどは含めないでください。
 
@@ -19,7 +19,7 @@ app.post("/chat", async (c) => {
   "main": {
     "word": "単語",
     "meaning": "意味（日本語）",
-    "partOfSpeech": "品詞",
+    "partOfSpeech": ["品詞1", "品詞2"], // 複数ある場合は配列で
     "pronunciation": "発音記号",
     "example": "英語の例文",
     "translation": "例文の日本訳"
@@ -27,7 +27,7 @@ app.post("/chat", async (c) => {
   "synonyms": {
     "word": "類義語（あれば）",
     "meaning": "意味（日本語）",
-    "partOfSpeech": "品詞",
+    "partOfSpeech": ["品詞1", "品詞2"],
     "pronunciation": "発音記号",
     "example": "英語の例文",
     "translation": "例文の日本訳"
@@ -35,7 +35,7 @@ app.post("/chat", async (c) => {
   "antonyms": {
     "word": "対義語（あれば）",
     "meaning": "意味（日本語）",
-    "partOfSpeech": "品詞",
+    "partOfSpeech": ["品詞1", "品詞2"],
     "pronunciation": "発音記号",
     "example": "英語の例文",
     "translation": "例文の日本訳"
