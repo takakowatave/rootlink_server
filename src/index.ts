@@ -11,7 +11,7 @@ app.get("/", (c) => c.text("Hono server is running!"));
 app.post("/chat", async (c) => {
   const { message } = await c.req.json();
 
-const prompt = `
+  const prompt = `
 次の英単語「${message}」について、日本語で以下の形式の**JSON文字列のみ**を返してください。
 装飾や説明文、バッククォートなどは含めないでください。
 
@@ -42,9 +42,6 @@ const prompt = `
   }
 }`;
 
-
-
-
   try {
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
@@ -61,7 +58,7 @@ const prompt = `
     const data = await response.json();
 
     // ✅ OpenAIの返答をパース
-    let parsed;
+    let parsed: any;
     try {
       const content = data?.choices?.[0]?.message?.content;
       const cleaned = content?.replace(/```json|```/g, "").trim();
@@ -71,32 +68,32 @@ const prompt = `
       return c.json({ error: "Invalid JSON returned by OpenAI", raw: data });
     }
 
-    // ✅ フロントが期待する形式で返す
-    return c.json({
-      main: {
-        ...parsed.main,
-        partOfSpeech: Array.isArray(parsed.main.partOfSpeech)
-          ? parsed.main.partOfSpeech
-          : [parsed.main.partOfSpeech],
-      },
-      synonyms: parsed.synonyms
-        ? {
-            ...parsed.synonyms,
-            partOfSpeech: Array.isArray(parsed.synonyms.partOfSpeech)
-              ? parsed.synonyms.partOfSpeech
-              : [parsed.synonyms.partOfSpeech],
-          }
-        : undefined,
-      antonyms: parsed.antonyms
-        ? {
-            ...parsed.antonyms,
-            partOfSpeech: Array.isArray(parsed.antonyms.partOfSpeech)
-              ? parsed.antonyms.partOfSpeech
-              : [parsed.antonyms.partOfSpeech],
-          }
-        : undefined,
+    // ✅ デバッグ出力
+    console.log("🧾 Final parsed before return:", {
+      main: parsed.main || parsed,
+      partOfSpeech:
+        parsed?.main?.partOfSpeech || parsed?.partOfSpeech || "（なし）",
     });
 
+    // ✅ partOfSpeechを必ず配列に統一
+    const normalizePOS = (item: any) => {
+      if (!item) return undefined;
+      return {
+        ...item,
+        partOfSpeech: Array.isArray(item.partOfSpeech)
+          ? item.partOfSpeech
+          : item.partOfSpeech
+          ? [item.partOfSpeech]
+          : [],
+      };
+    };
+
+    // ✅ フロントが期待する形式で返す
+    return c.json({
+      main: normalizePOS(parsed.main || parsed),
+      synonyms: normalizePOS(parsed.synonyms),
+      antonyms: normalizePOS(parsed.antonyms),
+    });
   } catch (err) {
     console.error("🔥 OpenAI fetch error:", err);
     return c.json({ error: "OpenAI fetch failed" });
@@ -107,4 +104,3 @@ const port = Number(process.env.PORT) || 8080;
 console.log(`🚀 Server running on port ${port}`);
 
 serve({ fetch: app.fetch, port });
-
