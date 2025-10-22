@@ -1,9 +1,11 @@
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
 import { cors } from "hono/cors";
+import auth from "./routes/auth";
 
 const app = new Hono();
 app.use("*", cors());
+app.route("/auth", auth);
 
 app.get("/", (c) => c.text("Hono server is running!"));
 
