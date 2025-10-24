@@ -1,23 +1,24 @@
+# ベースイメージ
 FROM node:20-alpine
 
+# 作業ディレクトリ
 WORKDIR /app
 
-# Copy package files
+# パッケージファイルをコピー
 COPY package*.json ./
 
-# ✅ devDependencies も含めて必ず全部インストール
-RUN npm install --omit=dev=false
+# 依存関係をインストール（開発依存も含める）
+RUN npm ci --include=dev
 
-# ✅ 念のため TypeScript を明示的にインストール
-RUN npm install typescript -g
-
-# Copy app files
+# ソースコードをコピー
 COPY . .
 
-# Build the project (TypeScript → JS)
+# TypeScriptをビルド（dist/ に出力）
 RUN npm run build
 
+# Cloud Run用ポート設定
 ENV PORT=8080
 EXPOSE 8080
 
-CMD ["npm", "start"]
+# ✅ 起動コマンド（npm start ではなく直接 node 実行）
+CMD ["node", "dist/index.js"]

@@ -1,47 +1,25 @@
 import { Hono } from "hono";
-import { serve } from "@hono/node-server";
 import { cors } from "hono/cors";
-import auth from "./routes/auth";
+import { serve } from "@hono/node-server"; // ← これを使う
+import auth from "./routes/auth.js";
 
 const app = new Hono();
 app.use("*", cors());
+
+// ✅ ヘルスチェック
+app.get("/", (c) => c.text("OK"));
+
+// ✅ Auth ルート
 app.route("/auth", auth);
 
-app.get("/", (c) => c.text("Hono server is running!"));
-
-// ✅ OpenAI APIを呼び出して、Gemini仕様のJSONを返す
+// ✅ Chat API
 app.post("/chat", async (c) => {
   const { message } = await c.req.json();
 
   const prompt = `
-次の英単語「${message}」について、日本語で以下の形式の**JSON文字列のみ**を返してください。
-装飾や説明文、バッククォートなどは含めないでください。
-
+次の英単語「${message}」について、日本語で以下の形式のJSONを返してください。
 {
-  "main": {
-    "word": "単語",
-    "meaning": "意味（日本語）",
-    "partOfSpeech": ["品詞1", "品詞2"], // 複数ある場合は配列で
-    "pronunciation": "発音記号",
-    "example": "英語の例文",
-    "translation": "例文の日本訳"
-  },
-  "synonyms": {
-    "word": "類義語（あれば）",
-    "meaning": "意味（日本語）",
-    "partOfSpeech": ["品詞1", "品詞2"],
-    "pronunciation": "発音記号",
-    "example": "英語の例文",
-    "translation": "例文の日本訳"
-  },
-  "antonyms": {
-    "word": "対義語（あれば）",
-    "meaning": "意味（日本語）",
-    "partOfSpeech": ["品詞1", "品詞2"],
-    "pronunciation": "発音記号",
-    "example": "英語の例文",
-    "translation": "例文の日本訳"
-  }
+  "main": { "word": "", "meaning": "", "partOfSpeech": [], "pronunciation": "", "example": "", "translation": "" }
 }`;
 
   try {
@@ -58,51 +36,24 @@ app.post("/chat", async (c) => {
     });
 
     const data = await response.json();
+    const cleaned = data?.choices?.[0]?.message?.content
+      ?.replace(/```json|```/g, "")
+      ?.trim();
 
-    // ✅ OpenAIの返答をパース
-    let parsed: any;
-    try {
-      const content = data?.choices?.[0]?.message?.content;
-      const cleaned = content?.replace(/```json|```/g, "").trim();
-      parsed = JSON.parse(cleaned);
-    } catch (err) {
-      console.error("❌ JSON parse error:", err);
-      return c.json({ error: "Invalid JSON returned by OpenAI", raw: data });
-    }
-
-    // ✅ デバッグ出力
-    console.log("🧾 Final parsed before return:", {
-      main: parsed.main || parsed,
-      partOfSpeech:
-        parsed?.main?.partOfSpeech || parsed?.partOfSpeech || "（なし）",
-    });
-
-    // ✅ partOfSpeechを必ず配列に統一
-    const normalizePOS = (item: any) => {
-      if (!item) return undefined;
-      return {
-        ...item,
-        partOfSpeech: Array.isArray(item.partOfSpeech)
-          ? item.partOfSpeech
-          : item.partOfSpeech
-          ? [item.partOfSpeech]
-          : [],
-      };
-    };
-
-    // ✅ フロントが期待する形式で返す
-    return c.json({
-      main: normalizePOS(parsed.main || parsed),
-      synonyms: normalizePOS(parsed.synonyms),
-      antonyms: normalizePOS(parsed.antonyms),
-    });
+    return c.json(JSON.parse(cleaned));
   } catch (err) {
     console.error("🔥 OpenAI fetch error:", err);
     return c.json({ error: "OpenAI fetch failed" });
   }
 });
 
+// ✅ Cloud Run 用ポート設定
 const port = Number(process.env.PORT) || 8080;
-console.log(`🚀 Server running on port ${port}`);
 
-serve({ fetch: app.fetch, port });
+// ✅ Cloud Run 向け: hono/node-server を使って起動
+serve({
+  fetch: app.fetch,
+  port,
+});
+
+console.log(`🚀 Server running on port ${port}`);
