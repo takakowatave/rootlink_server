@@ -1,12 +1,32 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { serve } from "@hono/node-server"; // ← これを使う
+import { serve } from "@hono/node-server";
 import auth from "./routes/auth.js";
 const app = new Hono();
-app.use("*", cors());
-// ✅ ヘルスチェック
+// ✅ 1. CORS を最上部で適用（OPTIONSも含めて必ず通るように）
+app.use("/*", cors({
+    origin: (origin) => {
+        if (!origin)
+            return "*"; // 一旦 * で全許可（検証用）
+        if (origin.endsWith(".vercel.app"))
+            return origin;
+        if (origin === "http://localhost:5173")
+            return origin;
+        if (origin === "https://rootlink.vercel.app")
+            return origin;
+        if (origin === "https://www.rootlink.jp")
+            return origin;
+        return "*";
+    },
+    allowMethods: ["GET", "POST", "OPTIONS"],
+    allowHeaders: ["Content-Type", "Authorization"],
+}));
+// ✅ 2. 明示的に OPTIONS を処理
+app.options("/chat", (c) => c.newResponse("ok", 204));
+app.options("*", (c) => c.newResponse("ok", 204));
+// ✅ 3. ヘルスチェック
 app.get("/", (c) => c.text("OK"));
-// ✅ Auth ルート
+// ✅ Authルート
 app.route("/auth", auth);
 // ✅ Chat API
 app.post("/chat", async (c) => {
@@ -36,14 +56,10 @@ app.post("/chat", async (c) => {
     }
     catch (err) {
         console.error("🔥 OpenAI fetch error:", err);
-        return c.json({ error: "OpenAI fetch failed" });
+        return c.json({ error: "OpenAI fetch failed" }, 500);
     }
 });
 // ✅ Cloud Run 用ポート設定
 const port = Number(process.env.PORT) || 8080;
-// ✅ Cloud Run 向け: hono/node-server を使って起動
-serve({
-    fetch: app.fetch,
-    port,
-});
-console.log(`🚀 Server running on port ${port}`);
+serve({ fetch: app.fetch, port });
+console.log(`🚀 RootLink Server running on port ${port}`);

@@ -1,7 +1,6 @@
 import { Hono } from "hono";
 import { createClient } from "@supabase/supabase-js";
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY // ✅ 管理者用キー
-);
+const supabase = createClient(process.env.SUPABASE_URL_ROOTLINK, process.env.SUPABASE_SERVICE_ROLE_KEY_ROOTLINK);
 const auth = new Hono();
 // --- サインアップ ---
 auth.post("/signup", async (c) => {
