@@ -34,7 +34,6 @@ app.options("*", (c) =>
   })
 );
 
-
 // ✅ 3. Health check
 app.get("/", (c) => c.text("OK"));
 
@@ -44,24 +43,27 @@ app.route("/auth", auth);
 app.post("/chat", async (c) => {
   const { message } = await c.req.json();
 
-    const prompt = `
-    次の英単語「${message}」について、日本語で以下の形式のJSONを返してください。
-    {
-      "main": { 
-        "word": "", 
-        "meaning": "", 
-        "partOfSpeech": [], 
-        "pronunciation": "", 
-        "example": "", 
-        "translation": "" 
-      },
-      "related": {
-        "synonyms": [],
-        "antonyms": [],
-        "derivedWords": [],
-        "collocations": []
-      }
-    }`;
+  const prompt = `
+  次の英単語「${message}」について、以下の形式のJSONを返してください。
+  出力はすべて英語で記述し、日本語は meaning と translation の値にのみ使ってください。
+
+  {
+    "main": { 
+      "word": "",              // 英語の単語名
+      "meaning": "",           // 日本語の意味
+      "partOfSpeech": [], 
+      "pronunciation": "", 
+      "example": "", 
+      "translation": ""        // 例文の日本語訳
+    },
+    "related": {
+      "synonyms": [],          // 英語のみ
+      "antonyms": [],          // 英語のみ
+      "derivedWords": [],      // 英語のみ
+      "collocations": []       // 英語のみ
+    }
+  }
+  `;
 
 
   try {
