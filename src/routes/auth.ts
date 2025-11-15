@@ -8,31 +8,54 @@ const supabase = createClient(
 
 const auth = new Hono();
 
-// --- サインアップ ---
+// --- サインアップ（確認メールを自動送信）---
 auth.post("/signup", async (c) => {
-  const { email, password } = await c.req.json();
+  try {
+    const { email, password } = await c.req.json();
+    console.log("[signup] received:", email);
 
-  const { data, error } = await supabase.auth.admin.createUser({
-    email,
-    password,
-    email_confirm: true,
-  });
+    const { data, error } = await supabase.auth.signUp({
+      email,
+      password,
+    });
 
-  if (error) return c.json({ error: error.message }, 400);
-  return c.json({ user: data.user });
+    if (error) {
+      console.error("[signup] signUp error:", error.message);
+      return c.json({ error: error.message }, 400);
+    }
+
+    console.log("[signup] confirmation mail sent:", email);
+
+    return c.json({
+      message: "確認メールを送信しました。メール内のリンクを開いて登録を完了してください。",
+    });
+  } catch (err) {
+    console.error("[signup] unexpected error:", err);
+    return c.json({ error: "Internal Server Error" }, 500);
+  }
 });
 
-// --- ログイン ---
+// --- ログイン（メール確認済みユーザーのみ成功）---
 auth.post("/login", async (c) => {
-  const { email, password } = await c.req.json();
+  try {
+    const { email, password } = await c.req.json();
 
-  const { data, error } = await supabase.auth.signInWithPassword({
-    email,
-    password,
-  });
+    const { data, error } = await supabase.auth.signInWithPassword({
+      email,
+      password,
+    });
 
-  if (error) return c.json({ error: error.message }, 400);
-  return c.json({ session: data.session });
+    if (error) {
+      console.error("[login] error:", error.message);
+      return c.json({ error: error.message }, 400);
+    }
+
+    console.log("[login] success:", data.user.email);
+    return c.json({ session: data.session, user: data.user });
+  } catch (err) {
+    console.error("[login] unexpected error:", err);
+    return c.json({ error: "Internal Server Error" }, 500);
+  }
 });
 
 export default auth;
