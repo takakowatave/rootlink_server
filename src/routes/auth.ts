@@ -24,17 +24,47 @@ auth.post("/signup", async (c) => {
       return c.json({ error: error.message }, 400);
     }
 
-    console.log("[signup] confirmation mail sent:", email);
+    // data.user が null のケース
+    // → メールリンク方式ではあり得る（メール送信されただけ）
+    if (!data.user) {
+      console.log("[signup] email confirmation sent (user null)");
+      return c.json({
+        message: "確認メールを送信しました。メール内のリンクを開いて登録を完了してください。",
+      });
+    }
+
+    // -------------------------
+    // ★ supabase.auth.signUp が user を返した場合
+    //    → ここで profiles に自動作成
+    // -------------------------
+    try {
+      await supabase
+        .from("profiles")
+        .insert({
+          id: data.user.id,
+          email: data.user.email,
+          username: data.user.email?.split("@")[0] ?? "",
+          avatar_url: null,
+        });
+
+      console.log("[signup] profile created:", data.user.id);
+    } catch (profileErr: any) {
+      console.error("[signup] profile insert error:", profileErr.message);
+      // profile の INSERT エラーは 500 にしない（ユーザー登録自体は成功しているため）
+    }
 
     return c.json({
-      message: "確認メールを送信しました。メール内のリンクを開いて登録を完了してください。",
+      user: {
+        id: data.user.id,
+        email: data.user.email,
+      },
+      message: "確認メールを送信しました。",
     });
   } catch (err) {
     console.error("[signup] unexpected error:", err);
     return c.json({ error: "Internal Server Error" }, 500);
   }
 });
-
 // --- ログイン（メール確認済みユーザーのみ成功）---
 auth.post("/login", async (c) => {
   try {
@@ -51,7 +81,11 @@ auth.post("/login", async (c) => {
     }
 
     console.log("[login] success:", data.user.email);
-    return c.json({ session: data.session, user: data.user });
+
+    return c.json({
+      session: data.session,
+      user: data.user,
+    });
   } catch (err) {
     console.error("[login] unexpected error:", err);
     return c.json({ error: "Internal Server Error" }, 500);

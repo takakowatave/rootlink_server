@@ -3,6 +3,7 @@ import { cors } from "hono/cors";
 import { serve } from "@hono/node-server";
 import auth from "./routes/auth.js";
 
+
 const app = new Hono();
 
 // ✅ 1. CORS
@@ -64,7 +65,6 @@ app.post("/chat", async (c) => {
     }
   }
   `;
-
 
   try {
     const response = await fetch("https://api.openai.com/v1/chat/completions", {
