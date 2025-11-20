@@ -92,4 +92,29 @@ auth.post("/login", async (c) => {
   }
 });
 
+// --- パスワード再設定メール送信 ---
+auth.post("/reset", async (c) => {
+  try {
+    const { email } = await c.req.json();
+
+    console.log("[password/reset] request:", email);
+
+    const { data, error } = await supabase.auth.resetPasswordForEmail(email, {
+      redirectTo: "https://rootlink.vercel.app/password/update"
+      // ← ローカルで動かすときは http://localhost:5173/password/update に変更して
+    });
+
+    if (error) {
+      console.error("[password/reset] error:", error.message);
+      return c.json({ error: error.message }, 400);
+    }
+
+    return c.json({ message: "OK" });
+  } catch (err) {
+    console.error("[password/reset] unexpected error:", err);
+    return c.json({ error: "Internal Server Error" }, 500);
+  }
+});
+
+
 export default auth;
