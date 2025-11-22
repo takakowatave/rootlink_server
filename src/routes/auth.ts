@@ -1,3 +1,4 @@
+// src/routes/auth.ts
 import { Hono } from "hono";
 import { createClient } from "@supabase/supabase-js";
 
@@ -8,7 +9,9 @@ const supabase = createClient(
 
 const auth = new Hono();
 
-// --- サインアップ（確認メールを自動送信）---
+// ==============================
+//  1. サインアップ（確認メール送信のみ）
+// ==============================
 auth.post("/signup", async (c) => {
   try {
     const { email, password } = await c.req.json();
@@ -24,48 +27,22 @@ auth.post("/signup", async (c) => {
       return c.json({ error: error.message }, 400);
     }
 
-    // data.user が null のケース
-    // → メールリンク方式ではあり得る（メール送信されただけ）
-    if (!data.user) {
-      console.log("[signup] email confirmation sent (user null)");
-      return c.json({
-        message: "確認メールを送信しました。メール内のリンクを開いて登録を完了してください。",
-      });
-    }
-
-    // -------------------------
-    // ★ supabase.auth.signUp が user を返した場合
-    //    → ここで profiles に自動作成
-    // -------------------------
-    try {
-      await supabase
-        .from("profiles")
-        .insert({
-          id: data.user.id,
-          email: data.user.email,
-          username: data.user.email?.split("@")[0] ?? "",
-          avatar_url: null,
-        });
-
-      console.log("[signup] profile created:", data.user.id);
-    } catch (profileErr: any) {
-      console.error("[signup] profile insert error:", profileErr.message);
-      // profile の INSERT エラーは 500 にしない（ユーザー登録自体は成功しているため）
-    }
+    console.log("[signup] confirmation email sent");
+    console.log("SERVICE ROLE KEY:", process.env.SUPABASE_SERVICE_ROLE_KEY_ROOTLINK?.slice(0,10));
 
     return c.json({
-      user: {
-        id: data.user.id,
-        email: data.user.email,
-      },
-      message: "確認メールを送信しました。",
+      message:
+        "確認メールを送信しました。メール内のリンクを開いて登録を完了してください。",
     });
   } catch (err) {
     console.error("[signup] unexpected error:", err);
     return c.json({ error: "Internal Server Error" }, 500);
   }
 });
-// --- ログイン（メール確認済みユーザーのみ成功）---
+
+// ==============================
+//  2. ログイン（メール確認後）＋ プロフィール自動作成
+// ==============================
 auth.post("/login", async (c) => {
   try {
     const { email, password } = await c.req.json();
@@ -80,11 +57,32 @@ auth.post("/login", async (c) => {
       return c.json({ error: error.message }, 400);
     }
 
-    console.log("[login] success:", data.user.email);
+    const user = data.user;
+
+    // ---- プロフィール存在チェック ----
+    const { data: existing } = await supabase
+      .from("profiles")
+      .select("id")
+      .eq("id", user.id)
+      .maybeSingle();
+
+    // ---- 初回ログインなら profile を自動作成 ----
+    if (!existing) {
+      console.log("[login] creating profile:", user.id);
+
+      await supabase.from("profiles").insert({
+        id: user.id,
+        email: user.email,
+        username: (user.email ?? "").split("@")[0],
+        avatar_url: null,
+      });
+    }
+
+    console.log("[login] success:", user.email);
 
     return c.json({
       session: data.session,
-      user: data.user,
+      user,
     });
   } catch (err) {
     console.error("[login] unexpected error:", err);
@@ -92,16 +90,19 @@ auth.post("/login", async (c) => {
   }
 });
 
-// --- パスワード再設定メール送信 ---
+// ==============================
+//  3. パスワード再設定メール送信
+// ==============================
 auth.post("/reset", async (c) => {
   try {
     const { email } = await c.req.json();
 
     console.log("[password/reset] request:", email);
 
-    const { data, error } = await supabase.auth.resetPasswordForEmail(email, {
-      redirectTo: "https://rootlink.vercel.app/password/update"
-      // ← ローカルで動かすときは http://localhost:5173/password/update に変更して
+    const { error } = await supabase.auth.resetPasswordForEmail(email, {
+      redirectTo: process.env.NODE_ENV === "production"
+        ? "https://rootlink.vercel.app/password/update"
+        : "http://localhost:5173/password/update",
     });
 
     if (error) {
@@ -115,6 +116,5 @@ auth.post("/reset", async (c) => {
     return c.json({ error: "Internal Server Error" }, 500);
   }
 });
-
 
 export default auth;
