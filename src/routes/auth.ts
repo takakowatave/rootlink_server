@@ -70,12 +70,19 @@ auth.post("/login", async (c) => {
     if (!existing) {
       console.log("[login] creating profile:", user.id);
 
-      await supabase.from("profiles").insert({
+      const createUser = await supabase.from("profiles").insert({
         id: user.id,
         email: user.email,
         username: (user.email ?? "").split("@")[0],
         avatar_url: null,
       });
+
+      console.log(createUser);
+      
+      if (createUser.error) {
+        console.error("[login] profile creation error:", createUser.error.message);
+      }
+
     }
 
     console.log("[login] success:", user.email);
