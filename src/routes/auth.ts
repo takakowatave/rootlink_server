@@ -1,34 +1,47 @@
-// src/routes/auth.ts
 import { Hono } from "hono";
-import { createClient } from "@supabase/supabase-js";
-
-const supabase = createClient(
-  process.env.SUPABASE_URL_ROOTLINK!,
-  process.env.SUPABASE_SERVICE_ROLE_KEY_ROOTLINK!
-);
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
 const auth = new Hono();
 
-// ==============================
-//  1. サインアップ（確認メール送信のみ）
-// ==============================
+/**
+ * Supabase client（遅延初期化）
+ * import 時には何もしない
+ */
+let supabase: SupabaseClient | null = null;
+
+function getSupabase(): SupabaseClient {
+  if (!supabase) {
+    const url = process.env.SUPABASE_URL_ROOTLINK;
+    const key = process.env.SUPABASE_SERVICE_ROLE_KEY_ROOTLINK;
+
+    if (!url || !key) {
+      throw new Error(
+        "Missing SUPABASE_URL_ROOTLINK or SUPABASE_SERVICE_ROLE_KEY_ROOTLINK"
+      );
+    }
+
+    supabase = createClient(url, key);
+  }
+
+  return supabase;
+}
+
+/* ==============================
+ * 1. サインアップ（確認メール送信）
+ * ============================== */
 auth.post("/signup", async (c) => {
   try {
     const { email, password } = await c.req.json();
-    console.log("[signup] received:", email);
+    const supabase = getSupabase();
 
-    const { data, error } = await supabase.auth.signUp({
+    const { error } = await supabase.auth.signUp({
       email,
       password,
     });
 
     if (error) {
-      console.error("[signup] signUp error:", error.message);
       return c.json({ error: error.message }, 400);
     }
-
-    console.log("[signup] confirmation email sent");
-    console.log("SERVICE ROLE KEY:", process.env.SUPABASE_SERVICE_ROLE_KEY_ROOTLINK?.slice(0,10));
 
     return c.json({
       message:
@@ -40,12 +53,13 @@ auth.post("/signup", async (c) => {
   }
 });
 
-// ==============================
-//  2. ログイン（メール確認後）＋ プロフィール自動作成
-// ==============================
+/* ==============================
+ * 2. ログイン + プロフィール自動作成
+ * ============================== */
 auth.post("/login", async (c) => {
   try {
     const { email, password } = await c.req.json();
+    const supabase = getSupabase();
 
     const { data, error } = await supabase.auth.signInWithPassword({
       email,
@@ -53,39 +67,34 @@ auth.post("/login", async (c) => {
     });
 
     if (error) {
-      console.error("[login] error:", error.message);
       return c.json({ error: error.message }, 400);
     }
 
     const user = data.user;
 
-    // ---- プロフィール存在チェック ----
     const { data: existing } = await supabase
       .from("profiles")
       .select("id")
       .eq("id", user.id)
       .maybeSingle();
 
-    // ---- 初回ログインなら profile を自動作成 ----
     if (!existing) {
-      console.log("[login] creating profile:", user.id);
+      const { error: insertError } = await supabase
+        .from("profiles")
+        .insert({
+          id: user.id,
+          email: user.email,
+          username: (user.email ?? "").split("@")[0],
+          avatar_url: null,
+        });
 
-      const createUser = await supabase.from("profiles").insert({
-        id: user.id,
-        email: user.email,
-        username: (user.email ?? "").split("@")[0],
-        avatar_url: null,
-      });
-
-      console.log(createUser);
-      
-      if (createUser.error) {
-        console.error("[login] profile creation error:", createUser.error.message);
+      if (insertError) {
+        console.error(
+          "[login] profile creation error:",
+          insertError.message
+        );
       }
-
     }
-
-    console.log("[login] success:", user.email);
 
     return c.json({
       session: data.session,
@@ -97,23 +106,22 @@ auth.post("/login", async (c) => {
   }
 });
 
-// ==============================
-//  3. パスワード再設定メール送信
-// ==============================
+/* ==============================
+ * 3. パスワード再設定メール送信
+ * ============================== */
 auth.post("/reset", async (c) => {
   try {
     const { email } = await c.req.json();
-
-    console.log("[password/reset] request:", email);
+    const supabase = getSupabase();
 
     const { error } = await supabase.auth.resetPasswordForEmail(email, {
-      redirectTo: process.env.NODE_ENV === "production"
-        ? "https://rootlink.vercel.app/password/update"
-        : "http://localhost:5173/password/update",
+      redirectTo:
+        process.env.NODE_ENV === "production"
+          ? "https://rootlink.vercel.app/password/update"
+          : "http://localhost:5173/password/update",
     });
 
     if (error) {
-      console.error("[password/reset] error:", error.message);
       return c.json({ error: error.message }, 400);
     }
 
