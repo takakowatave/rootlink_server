@@ -1,7 +1,9 @@
+import 'dotenv/config';
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { serve } from "@hono/node-server";
 import auth from "./routes/auth.js";
+import { resolveQuery } from "./lib/resolveQuery.js";
 const app = new Hono();
 /* =========================
  * 1. CORS
@@ -32,78 +34,37 @@ app.get("/", (c) => c.text("OK"));
  * ========================= */
 app.route("/auth", auth);
 /* =========================
- * 4. Chat (Word Generator)
+ * 4. resolveQuery
  * ========================= */
-app.post("/chat", async (c) => {
-    const { message } = await c.req.json();
-    const prompt = `
-For the English word "${message}", return JSON ONLY in the exact format below.
-
-All output must be in English.
-Japanese is allowed ONLY in "meaning" and "translation".
-
-========================
-ETYMology Hook Rules
-========================
-- Must be EXACTLY ONE sentence.
-- No line breaks.
-- No explanations or hedging.
-- Prioritize memorability over academic accuracy.
-
-Choose ONE type:
-Type A: prefix + root (+ suffix)
-Type B: root-based hub (shared image)
-Type C: origin-based (no clear segmentation)
-Type D: pure image (no etymology)
-
-========================
-Derived Words Rules
-========================
-- Include ONLY words that share the same root or etymological origin.
-- NO explanations.
-- Max 3 words.
-- If none exist, return [].
-
-========================
-Synonyms / Antonyms Rules
-========================
-- ALWAYS include both.
-- 1–2 words each.
-- Common, high-frequency words only.
-- English words only.
-
-========================
-Return this JSON format
-========================
-
-{
-  "main": {
-    "word": "",
-    "meaning": "",
-    "partOfSpeech": [],
-    "pronunciation": "",
-    "example": "",
-    "translation": ""
-  },
-  "etymologyHook": {
-    "type": "A | B | C | D",
-    "text": ""
-  },
-  "derivedWords": [
-    {
-      "word": "",
-      "partOfSpeech": "",
-      "pronunciation": "",
-      "meaning": ""
-    }
-  ],
-  "related": {
-    "synonyms": [],
-    "antonyms": []
-  }
-}
-`;
+app.post("/resolve", async (c) => {
     try {
+        const body = await c.req.json();
+        const input = body?.query;
+        if (!input) {
+            return c.json({ error: "query required" }, 400);
+        }
+        const result = await resolveQuery(input);
+        return c.json(result);
+    }
+    catch (err) {
+        console.error(err);
+        return c.json({ error: "resolve failed" }, 500);
+    }
+});
+/* =========================
+ * 5. Chat (AI Executor)
+ * =========================
+ * - プロンプトはフロントから受け取る
+ * - server は OpenAI API を叩くだけ
+ * - API Key は server から出ない
+ */
+app.post("/chat", async (c) => {
+    try {
+        const body = await c.req.json();
+        const prompt = body?.prompt;
+        if (!prompt || typeof prompt !== "string") {
+            return c.json({ error: "Invalid request: prompt is required" }, 400);
+        }
         const response = await fetch("https://api.openai.com/v1/chat/completions", {
             method: "POST",
             headers: {
@@ -116,19 +77,29 @@ Return this JSON format
                 temperature: 0.7,
             }),
         });
+        if (!response.ok) {
+            const text = await response.text();
+            console.error("🔥 OpenAI API error:", text);
+            return c.json({ error: "OpenAI API error" }, 500);
+        }
         const data = await response.json();
         const cleaned = data?.choices?.[0]?.message?.content
             ?.replace(/```json|```/g, "")
             ?.trim();
+        console.log("🧠 Prompt snippet:", prompt.slice(0, 120));
+        console.log("🧠 AI raw content:", cleaned);
+        if (!cleaned) {
+            return c.json({ error: "Empty response from OpenAI" }, 500);
+        }
         return c.json(JSON.parse(cleaned));
     }
     catch (err) {
-        console.error("🔥 OpenAI fetch error:", err);
-        return c.json({ error: "OpenAI fetch failed" }, 500);
+        console.error("🔥 Server error:", err);
+        return c.json({ error: "Server error" }, 500);
     }
 });
 /* =========================
- * 5. Cloud Run
+ * 6. Cloud Run
  * ========================= */
 const port = Number(process.env.PORT) || 8080;
 serve({

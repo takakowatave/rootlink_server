@@ -1,7 +1,9 @@
+import 'dotenv/config'
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { serve } from "@hono/node-server";
 import auth from "./routes/auth.js";
+import { resolveQuery } from "./lib/resolveQuery.js";
 
 const app = new Hono();
 
@@ -36,8 +38,30 @@ app.get("/", (c) => c.text("OK"));
  * ========================= */
 app.route("/auth", auth);
 
+
 /* =========================
- * 4. Chat (AI Executor)
+ * 4. resolveQuery
+ * ========================= */
+app.post("/resolve", async (c) => {
+  try {
+    const body = await c.req.json();
+    const input = body?.query;
+
+    if (!input) {
+      return c.json({ error: "query required" }, 400);
+    }
+
+    const result = await resolveQuery(input);
+    return c.json(result);
+
+  } catch (err) {
+    console.error(err);
+    return c.json({ error: "resolve failed" }, 500);
+  }
+});
+
+/* =========================
+ * 5. Chat (AI Executor)
  * =========================
  * - プロンプトはフロントから受け取る
  * - server は OpenAI API を叩くだけ
@@ -81,8 +105,12 @@ app.post("/chat", async (c) => {
     const data = await response.json();
 
     const cleaned = data?.choices?.[0]?.message?.content
-      ?.replace(/```json|```/g, "")
-      ?.trim();
+    ?.replace(/```json|```/g, "")
+    ?.trim();
+  
+  console.log("🧠 Prompt snippet:", prompt.slice(0, 120));
+  console.log("🧠 AI raw content:", cleaned);
+  
 
     if (!cleaned) {
       return c.json(
@@ -99,7 +127,7 @@ app.post("/chat", async (c) => {
 });
 
 /* =========================
- * 5. Cloud Run
+ * 6. Cloud Run
  * ========================= */
 const port = Number(process.env.PORT) || 8080;
 
@@ -110,3 +138,5 @@ serve({
 });
 
 console.log(`🚀 RootLink Server running on port ${port}`);
+
+

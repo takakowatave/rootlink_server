@@ -1,7 +1,7 @@
 {
   "name": "rootlink_server",
   "version": "1.0.0",
-  "type": "module", 
+  "type": "module",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
@@ -17,7 +17,8 @@
     "@hono/node-server": "^1.19.5",
     "@supabase/supabase-js": "^2.74.0",
     "dotenv": "^17.2.3",
-    "hono": "^4.9.10"
+    "hono": "^4.9.10",
+    "wink-lemmatizer": "^3.0.4"
   },
   "devDependencies": {
     "@types/node": "^24.7.0",
