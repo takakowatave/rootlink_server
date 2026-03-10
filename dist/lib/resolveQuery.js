@@ -6,53 +6,94 @@ function isSingleWord(s) {
 function isWordToken(s) {
     return /^[a-z]+$/.test(s);
 }
-/** 辞書APIで「その単語が実在するか」だけを判定する */
-async function wordExists(word, cache) {
-    const key = word;
-    const hit = cache.get(key);
-    if (hit !== undefined)
-        return hit;
-    const res = await fetch(`https://api.dictionaryapi.dev/api/v2/entries/en/${encodeURIComponent(word)}`, { cache: "no-store" });
-    const ok = res.status === 200;
-    cache.set(key, ok);
-    return ok;
+/* =========================
+   Oxford Sandbox Base URL
+========================= */
+const BASE_URL = "https://od-api-sandbox.oxforddictionaries.com/api/v2";
+/* =========================
+   Oxford API 呼び出し
+========================= */
+async function fetchDictionary(word, cache) {
+    if (cache.has(word)) {
+        return cache.get(word) ?? null;
+    }
+    try {
+        console.log("=== OXFORD FETCH START ===", word);
+        console.log("APP_ID exists:", !!process.env.OXFORD_APP_ID);
+        console.log("APP_KEY exists:", !!process.env.OXFORD_APP_KEY);
+        const res = await fetch(`${BASE_URL}/entries/en-gb/${encodeURIComponent(word)}`, {
+            headers: {
+                app_id: process.env.OXFORD_APP_ID,
+                app_key: process.env.OXFORD_APP_KEY,
+            },
+            cache: "no-store",
+        });
+        console.log("OXFORD STATUS:", res.status);
+        const rawText = await res.text();
+        console.log("OXFORD RAW TEXT:", rawText);
+        if (!res.ok) {
+            cache.set(word, null);
+            return null;
+        }
+        const data = JSON.parse(rawText);
+        console.log("OXFORD RAW JSON:", JSON.stringify(data, null, 2));
+        if (!data?.results?.length) {
+            cache.set(word, null);
+            return null;
+        }
+        cache.set(word, data);
+        return data;
+    }
+    catch (e) {
+        console.error("OXFORD FETCH ERROR:", e);
+        cache.set(word, null);
+        return null;
+    }
 }
-/** Datamuseで「近い候補」を1件だけ取る */
+/* =========================
+   Datamuse typo suggestion
+========================= */
 async function getSuggestion(word, cache) {
-    const key = word;
-    if (cache.has(key))
-        return cache.get(key) ?? null;
+    if (cache.has(word))
+        return cache.get(word) ?? null;
     const res = await fetch(`https://api.datamuse.com/sug?s=${encodeURIComponent(word)}&max=1`, { cache: "no-store" });
     if (!res.ok) {
-        cache.set(key, null);
+        cache.set(word, null);
         return null;
     }
     const data = await res.json();
     const cand = (data?.[0]?.word ?? "").toLowerCase();
     if (!cand || !isSingleWord(cand) || cand === word) {
-        cache.set(key, null);
+        cache.set(word, null);
         return null;
     }
-    cache.set(key, cand);
+    cache.set(word, cand);
     return cand;
 }
-/** 単語を解決 */
-async function resolveWord(raw, existsCache, suggestCache) {
+/* =========================
+   単語解決
+========================= */
+async function resolveWord(raw, dictCache, suggestCache) {
     const normalized = normalizeWord(raw);
-    if (isSingleWord(normalized) && (await wordExists(normalized, existsCache))) {
-        return normalized;
-    }
     if (!isSingleWord(normalized))
         return null;
+    const dict = await fetchDictionary(normalized, dictCache);
+    if (dict) {
+        return { resolved: normalized, dictionary: dict };
+    }
     const suggestion = await getSuggestion(normalized, suggestCache);
     if (!suggestion)
         return null;
-    if (await wordExists(suggestion, existsCache))
-        return suggestion;
+    const dict2 = await fetchDictionary(suggestion, dictCache);
+    if (dict2) {
+        return { resolved: suggestion, dictionary: dict2 };
+    }
     return null;
 }
-/** 熟語を解決 */
-async function resolveLexicalUnit(raw, existsCache, suggestCache) {
+/* =========================
+   熟語解決
+========================= */
+async function resolveLexicalUnit(raw, dictCache, suggestCache) {
     const normalized = normalizeLexicalUnit(raw);
     const tokens = normalized.split(/(\s+|-)/);
     for (let i = 0; i < tokens.length; i++) {
@@ -61,12 +102,14 @@ async function resolveLexicalUnit(raw, existsCache, suggestCache) {
             continue;
         if (!isWordToken(t))
             continue;
-        if (await wordExists(t, existsCache))
+        const exists = await fetchDictionary(t, dictCache);
+        if (exists)
             continue;
         const suggestion = await getSuggestion(t, suggestCache);
         if (!suggestion)
             return null;
-        if (!(await wordExists(suggestion, existsCache)))
+        const exists2 = await fetchDictionary(suggestion, dictCache);
+        if (!exists2)
             return null;
         tokens[i] = suggestion;
     }
@@ -74,23 +117,22 @@ async function resolveLexicalUnit(raw, existsCache, suggestCache) {
 }
 export async function resolveQuery(raw) {
     const input = raw.trim().toLowerCase();
-    const existsCache = new Map();
+    const dictCache = new Map();
     const suggestCache = new Map();
-    // 単語
     if (isSingleWord(input)) {
-        const resolved = await resolveWord(input, existsCache, suggestCache);
-        if (!resolved)
+        const result = await resolveWord(input, dictCache, suggestCache);
+        if (!result)
             return { ok: false, reason: "NO_SUGGESTION" };
         return {
             ok: true,
-            resolved,
-            changed: resolved !== input,
+            resolved: result.resolved,
+            changed: result.resolved !== input,
             kind: "word",
-            redirectTo: `/word/${resolved}`,
+            redirectTo: `/word/${result.resolved}`,
+            dictionary: result.dictionary,
         };
     }
-    // 熟語
-    const resolvedLU = await resolveLexicalUnit(input, existsCache, suggestCache);
+    const resolvedLU = await resolveLexicalUnit(input, dictCache, suggestCache);
     if (!resolvedLU)
         return { ok: false, reason: "NO_SUGGESTION" };
     return {
