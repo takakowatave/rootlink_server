@@ -146,7 +146,7 @@ export async function resolveQuery(raw: string): Promise<ResolveResult> {
 
   if (cachedWord) {
     const { data: cached } = await supabase
-      .from("oxford_raw")
+      .from("dictionary_cache")
       .select("payload")
       .eq("word_id", cachedWord.id)
       .limit(1)
@@ -204,7 +204,7 @@ export async function resolveQuery(raw: string): Promise<ResolveResult> {
       wordId = data!.id
     }
 
-    await supabase.from("oxford_raw").upsert({
+    await supabase.from("dictionary_cache").upsert({
       word_id: wordId,
       payload: dictionary,
     })
@@ -263,7 +263,7 @@ export async function resolveQuery(raw: string): Promise<ResolveResult> {
     wordId = data!.id
   }
 
-  await supabase.from("oxford_raw").upsert({
+  await supabase.from("dictionary_cache").upsert({
     word_id: wordId,
     payload: dictionary,
   })
