@@ -1,6 +1,10 @@
 import { normalizeWord } from "./normalize.js"
 import { getSupabase } from "../lib/supabase.js"
 import { generateDerivatives } from "../lib/generateDerivatives.js"
+import {
+  rewriteDictionary,
+  type RewrittenDictionary,
+} from "../lib/rewriteDictionary.js"
 
 /**
  * resolveQuery.ts
@@ -8,36 +12,50 @@ import { generateDerivatives } from "../lib/generateDerivatives.js"
  * 検索時の入口。
  * 1. dictionary_cache を確認
  * 2. なければ Oxford を取得
- * 3. 必要項目だけ整形
- * 4. 整形済み JSON を保存して返す
+ * 3. normalizeDictionary で必要項目だけ整形
+ * 4. rewriteDictionary で完成済み RootLink JSON に変換する
+ * 5. 完成済み JSON を保存して返す
  *
  * ※ Oxford raw は保存しない
+ * ※ lexicalUnits は「熟語 / 句」
+ * ※ 品詞ごとの sense は senseGroups に分ける
  */
 
 type SuggestCache = Map<string, string | null>
 
 const BASE_URL = "https://od-api-sandbox.oxforddictionaries.com/api/v2"
 
-/** sense 単位の整形データ */
-type NormalizedSense = {
+/** RootLink の 1 sense 表示ブロック（現状は Oxford 側の区切りにかなり近い） */
+export type NormalizedSense = {
   senseNumber: string
-  definitions: string[]
-  examples: string[]
+  definition: string
+  example: string | null
 }
 
-/** 品詞単位の整形データ */
-type NormalizedLexicalUnit = {
+/** 品詞ごとの sense 群 */
+export type NormalizedSenseGroup = {
   partOfSpeech: string
+  totalSenseCount: number
+  shownSenseCount: number
+  hasMoreSenses: boolean
   senses: NormalizedSense[]
 }
 
-/** dictionary_cache.payload に保存する最終形 */
-type NormalizedDictionary = {
+/** 熟語 / 句 */
+export type NormalizedLexicalUnit = {
+  lexicalUnitId: string
+  text: string
+}
+
+/** normalizeDictionary が返す中間形 */
+export type NormalizedDictionary = {
   word: string
   ipa: string | null
   inflections: string[]
+  senseGroups: NormalizedSenseGroup[]
   lexicalUnits: NormalizedLexicalUnit[]
   derivatives: string[]
+  etymology: string | null
 }
 
 /* =========================
@@ -89,7 +107,7 @@ async function fetchInflections(word: string): Promise<string[]> {
       ?.map((i: any) => i?.inflectedForm)
       ?.filter((v: any): v is string => typeof v === "string" && v.trim().length > 0) ?? []
 
-  return [...new Set(forms.map((v) => v.trim()))]
+  return uniqueStrings(forms)
 }
 
 /* =========================
@@ -138,6 +156,16 @@ function uniqueStrings(values: unknown[]): string[] {
   )]
 }
 
+/** lexicalUnitId 用の簡易 ID。 */
+function toStableId(text: string): string {
+  return text
+    .trim()
+    .toLowerCase()
+    .replace(/['’]/g, "")
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+}
+
 /** IPA を 1 つだけ取る。優先: lexicalEntry -> entry */
 function extractIPA(data: any): string | null {
   const lexicalEntries: any[] = (data?.results ?? []).flatMap(
@@ -162,22 +190,47 @@ function extractIPA(data: any): string | null {
   return null
 }
 
-/** definitions / shortDefinitions をまとめる。 */
-function extractDefinitions(sense: any): string[] {
-  return uniqueStrings([
+/** etymology を 1 つだけ取る。 */
+function extractEtymology(data: any): string | null {
+  const lexicalEntries: any[] = (data?.results ?? []).flatMap(
+    (r: any) => r?.lexicalEntries ?? []
+  )
+
+  const fromEntry = lexicalEntries
+    .flatMap((le: any) => le?.entries ?? [])
+    .flatMap((entry: any) => entry?.etymologies ?? [])
+    .find((v: any) => typeof v === "string" && v.trim().length > 0)
+
+  if (fromEntry) return fromEntry.trim()
+
+  const fromLexicalEntry = lexicalEntries
+    .flatMap((le: any) => le?.etymologies ?? [])
+    .find((v: any) => typeof v === "string" && v.trim().length > 0)
+
+  if (fromLexicalEntry) return fromLexicalEntry.trim()
+
+  return null
+}
+
+/** definitions / shortDefinitions から最初の 1 件を取る。 */
+function extractPrimaryDefinition(sense: any): string | null {
+  const definitions = uniqueStrings([
     ...(sense?.definitions ?? []),
     ...(sense?.shortDefinitions ?? []),
   ])
+
+  return definitions[0] ?? null
 }
 
-/** examples[].text を抜く。 */
-function extractExamples(sense: any): string[] {
+/** examples[].text から最初の 1 件を取る。 */
+function extractPrimaryExample(sense: any): string | null {
   const examples =
     sense?.examples
       ?.map((e: any) => e?.text)
       ?.filter((v: any): v is string => typeof v === "string") ?? []
 
-  return uniqueStrings(examples)
+  const unique = uniqueStrings(examples)
+  return unique[0] ?? null
 }
 
 /** senses と subsenses を 1 本に並べる。 */
@@ -204,52 +257,131 @@ function normalizePartOfSpeech(le: any): string {
   return typeof value === "string" ? value.trim() : ""
 }
 
-/** Oxford の lexicalEntries を RootLink 用 lexicalUnits に変換。 */
-function extractLexicalUnits(data: any): NormalizedLexicalUnit[] {
+/** 品詞ごとの sense 群を作る。 */
+function extractSenseGroups(data: any): NormalizedSenseGroup[] {
   const lexicalEntries: any[] = (data?.results ?? []).flatMap(
     (r: any) => r?.lexicalEntries ?? []
   )
 
-  return lexicalEntries
-    .map((le: any) => {
-      const partOfSpeech = normalizePartOfSpeech(le)
-      const flattened = flattenSenses(le)
+  const posMap = new Map<string, Array<{ definition: string; example: string | null }>>()
 
-      const senses: NormalizedSense[] = flattened
-        .map((sense: any, index: number) => {
-          const definitions = extractDefinitions(sense)
-          const examples = extractExamples(sense)
+  for (const le of lexicalEntries) {
+    const partOfSpeech = normalizePartOfSpeech(le)
+    if (!partOfSpeech) continue
 
-          return {
-            senseNumber: String(index + 1),
-            definitions,
-            examples,
-          }
-        })
-        .filter(
-          (sense: NormalizedSense) =>
-            sense.definitions.length > 0 || sense.examples.length > 0
-        )
+    const flattened = flattenSenses(le)
 
-      return {
-        partOfSpeech,
-        senses,
-      }
-    })
-    .filter(
-      (unit: NormalizedLexicalUnit) =>
-        unit.partOfSpeech.length > 0 && unit.senses.length > 0
-    )
+    const items = flattened
+      .map((sense: any) => {
+        const definition = extractPrimaryDefinition(sense)
+        const example = extractPrimaryExample(sense)
+
+        if (!definition && !example) return null
+
+        return {
+          definition: definition ?? "",
+          example,
+        }
+      })
+      .filter((item): item is { definition: string; example: string | null } => item !== null)
+
+    if (items.length === 0) continue
+
+    const existing = posMap.get(partOfSpeech) ?? []
+    posMap.set(partOfSpeech, [...existing, ...items])
+  }
+
+  return [...posMap.entries()].map(([partOfSpeech, rawSenses]) => {
+    const totalSenseCount = rawSenses.length
+
+    return {
+      partOfSpeech,
+      totalSenseCount,
+      shownSenseCount: totalSenseCount,
+      hasMoreSenses: false,
+      senses: rawSenses.map((sense, index) => ({
+        senseNumber: String(index + 1),
+        definition: sense.definition,
+        example: sense.example,
+      })),
+    }
+
+    return {
+      partOfSpeech,
+      totalSenseCount,
+      shownSenseCount: totalSenseCount,
+      hasMoreSenses: false,
+      senses: rawSenses.map((sense, index) => ({
+        senseNumber: String(index + 1),
+        definition: sense.definition,
+        example: sense.example,
+      })),
+    }
+  })
 }
 
-/** 保存用 payload を組み立てる。 */
-async function buildDictionaryPayload(
+/**
+ * 熟語 / 句を抽出する。
+ * ここでは主に
+ * - lexicalEntry.phrases
+ * - entry.phrases
+ * - sense.constructions
+ * を拾う
+ */
+function extractLexicalUnits(data: any, word: string): NormalizedLexicalUnit[] {
+  const lexicalEntries: any[] = (data?.results ?? []).flatMap(
+    (r: any) => r?.lexicalEntries ?? []
+  )
+
+  const collected: string[] = []
+
+  for (const le of lexicalEntries) {
+    const lePhrases =
+      le?.phrases
+        ?.map((p: any) => p?.text)
+        ?.filter((v: any): v is string => typeof v === "string") ?? []
+
+    collected.push(...lePhrases)
+
+    const entryPhrases =
+      (le?.entries ?? []).flatMap((entry: any) =>
+        entry?.phrases
+          ?.map((p: any) => p?.text)
+          ?.filter((v: any): v is string => typeof v === "string") ?? []
+      ) ?? []
+
+    collected.push(...entryPhrases)
+
+    const constructions =
+      flattenSenses(le).flatMap((sense: any) =>
+        sense?.constructions
+          ?.map((c: any) => c?.text)
+          ?.filter((v: any): v is string => typeof v === "string") ?? []
+      ) ?? []
+
+    collected.push(...constructions)
+  }
+
+  const unique = uniqueStrings(collected).filter(
+    (text) => text.toLowerCase() !== word.toLowerCase()
+  )
+
+  return unique.map((text) => ({
+    lexicalUnitId: toStableId(text),
+    text,
+  }))
+}
+
+/** normalizeDictionary 本体。Oxford raw は保存せず、中間形だけ返す。 */
+async function normalizeDictionary(
   word: string,
   entries: any
 ): Promise<NormalizedDictionary> {
   const inflections = await fetchInflections(word)
-  const lexicalUnits = extractLexicalUnits(entries)
+  const senseGroups = extractSenseGroups(entries)
+  const lexicalUnits = extractLexicalUnits(entries, word)
   const ipa = extractIPA(entries)
+  const etymology = extractEtymology(entries)
 
   let derivatives: string[] = []
   try {
@@ -262,8 +394,10 @@ async function buildDictionaryPayload(
     word,
     ipa,
     inflections,
+    senseGroups,
     lexicalUnits,
     derivatives: uniqueStrings(derivatives),
+    etymology,
   }
 }
 
@@ -309,8 +443,8 @@ async function ensureWordId(word: string): Promise<string> {
   return data.id
 }
 
-/** dictionary_cache から整形済み payload を読む。 */
-async function getCachedDictionary(word: string): Promise<NormalizedDictionary | null> {
+/** dictionary_cache から完成済み payload を読む。 */
+async function getCachedDictionary(word: string): Promise<RewrittenDictionary | null> {
   const supabase = getSupabase()
 
   const wordId = await findWordId(word)
@@ -328,11 +462,11 @@ async function getCachedDictionary(word: string): Promise<NormalizedDictionary |
     return null
   }
 
-  return (data?.payload as NormalizedDictionary | null) ?? null
+  return (data?.payload as RewrittenDictionary | null) ?? null
 }
 
-/** 整形済み payload だけを保存する。 */
-async function saveDictionary(word: string, payload: NormalizedDictionary): Promise<void> {
+/** 完成済み payload だけを保存する。 */
+async function saveDictionary(word: string, payload: RewrittenDictionary): Promise<void> {
   const supabase = getSupabase()
   const wordId = await ensureWordId(word)
 
@@ -358,14 +492,53 @@ export type ResolveResult =
       resolved: string
       changed: boolean
       redirectTo: string
-      dictionary: NormalizedDictionary
+      dictionary: RewrittenDictionary
     }
   | { ok: false; reason: "NO_RESULT" }
 
+/** lookup 候補。phrase を先に試し、だめなら先頭語も試す。 */
+function buildLookupCandidates(input: string): string[] {
+  const values = [input]
+
+  if (input.includes(" ")) {
+    values.push(input.split(/\s+/)[0])
+  }
+
+  return uniqueStrings(values)
+}
+
+/** 候補を順に調べ、cache にあれば返し、なければ Oxford API で取得する。 */
+async function resolveFromCandidates(
+  candidates: string[]
+): Promise<{ resolved: string; dictionary: RewrittenDictionary } | null> {
+  for (const candidate of candidates) {
+    const cached = await getCachedDictionary(candidate)
+
+    if (cached) {
+      console.log("DICTIONARY CACHE HIT:", candidate)
+      return { resolved: candidate, dictionary: cached }
+    }
+
+    console.log("DICTIONARY CACHE MISS:", candidate)
+
+    const entries = await fetchEntries(candidate)
+    if (!entries) continue
+
+    const normalized = await normalizeDictionary(candidate, entries)
+    const dictionary = await rewriteDictionary(normalized)
+
+    await saveDictionary(candidate, dictionary)
+    console.log("DICTIONARY CACHE SAVED:", candidate)
+
+    return { resolved: candidate, dictionary }
+  }
+
+  return null
+}
 /**
  * 検索の本体。
  * cache hit なら返す。
- * miss なら Oxford -> 整形 -> 保存 -> 返す。
+ * miss なら Oxford -> normalize -> rewrite -> 保存 -> 返す。
  */
 export async function resolveQuery(raw: string): Promise<ResolveResult> {
   console.log("RESOLVE QUERY START:", raw)
@@ -374,57 +547,36 @@ export async function resolveQuery(raw: string): Promise<ResolveResult> {
   const suggestCache: SuggestCache = new Map()
 
   const normalized = normalizeWord(input)
-  const lookup = normalized.split(/\s+/)[0]
+  const candidates = buildLookupCandidates(normalized)
 
-  /* 1. cache check */
+  /* 1. exact / headword lookup */
+  const direct = await resolveFromCandidates(candidates)
 
-  const cached = await getCachedDictionary(lookup)
-
-  if (cached) {
-    console.log("DICTIONARY CACHE HIT:", lookup)
-
+  if (direct) {
     return {
       ok: true,
-      resolved: lookup,
-      changed: lookup !== input,
-      redirectTo: `/word/${lookup}`,
-      dictionary: cached,
+      resolved: direct.resolved,
+      changed: direct.resolved !== input,
+      redirectTo: `/word/${direct.resolved}`,
+      dictionary: direct.dictionary,
     }
   }
 
-  /* 2. Oxford lookup */
+  /* 2. suggestion fallback */
+  const suggestionBase =
+    normalized.includes(" ") ? normalized.split(/\s+/)[0] : normalized
 
-  let entries = await fetchEntries(lookup)
-
-  if (entries) {
-    const dictionary = await buildDictionaryPayload(lookup, entries)
-    await saveDictionary(lookup, dictionary)
-
-    return {
-      ok: true,
-      resolved: lookup,
-      changed: lookup !== input,
-      redirectTo: `/word/${lookup}`,
-      dictionary,
-    }
-  }
-
-  /* 3. suggestion fallback */
-
-  const suggestion = await getSuggestion(normalized, suggestCache)
+  const suggestion = await getSuggestion(suggestionBase, suggestCache)
   if (!suggestion) return { ok: false, reason: "NO_RESULT" }
 
-  entries = await fetchEntries(suggestion)
-  if (!entries) return { ok: false, reason: "NO_RESULT" }
-
-  const dictionary = await buildDictionaryPayload(suggestion, entries)
-  await saveDictionary(suggestion, dictionary)
+  const suggested = await resolveFromCandidates([suggestion])
+  if (!suggested) return { ok: false, reason: "NO_RESULT" }
 
   return {
     ok: true,
-    resolved: suggestion,
-    changed: suggestion !== input,
-    redirectTo: `/word/${suggestion}`,
-    dictionary,
+    resolved: suggested.resolved,
+    changed: suggested.resolved !== input,
+    redirectTo: `/word/${suggested.resolved}`,
+    dictionary: suggested.dictionary,
   }
 }

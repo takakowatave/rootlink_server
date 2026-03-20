@@ -1,3 +1,14 @@
+/**
+ * generateDerivatives
+ *
+ * OpenAI を使って単語の派生語（word family）を生成する。
+ * 返り値は string[]。
+ *
+ * - generateDerivatives: API を呼んで派生語を取得
+ * - safeParseDerivatives: JSON を安全に配列へ変換
+ * - stripCodeFence: ```json ... ``` の囲みを除去
+ */
+
 function stripCodeFence(text: string): string {
     return text
       .replace(/^```json\s*/i, "")
