@@ -2,10 +2,12 @@ import { normalizeWord } from "./normalize.js"
 import { getSupabase } from "../lib/supabase.js"
 import { generateDerivatives } from "../lib/generateDerivatives.js"
 import { normalizeDictionary } from "../lib/normalizeDictionary.js"
+import type { AiJsonGenerator } from "./buildEtymologyData.js"
 import {
   rewriteDictionary,
   type RewrittenDictionary,
 } from "../lib/rewriteDictionary.js"
+import { getLemma } from "./lemma.js"
 
 /**
  * resolveQuery.ts
@@ -24,7 +26,11 @@ import {
 
 type SuggestCache = Map<string, string | null>
 
-const BASE_URL = "https://od-api-sandbox.oxforddictionaries.com/api/v2"
+const BASE_URL = "https://od-api.oxforddictionaries.com/api/v2"
+const OPENAI_API_URL =
+  process.env.OPENAI_API_URL ?? "https://api.openai.com/v1/chat/completions"
+const OPENAI_MODEL =
+  process.env.OPENAI_TEXT_MODEL ?? process.env.OPENAI_MODEL ?? "gpt-4.1-mini"
 
 type DictionaryCacheRow = {
   payload?: unknown
@@ -37,6 +43,8 @@ type WordRow = {
 type DatamuseSuggestion = {
   word?: unknown
 }
+
+const inFlightResolves = new Map<string, Promise<ResolveResult>>()
 
 /* =========================
    Shared helpers
@@ -64,27 +72,122 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null
 }
 
+class OxfordUsageLimitError extends Error {
+  constructor() {
+    super("OXFORD_USAGE_LIMIT_EXCEEDED")
+    this.name = "OxfordUsageLimitError"
+  }
+}
+
+function assertOpenAIEnv(): void {
+  if (!process.env.OPENAI_API_KEY) {
+    throw new Error("OPENAI_API_KEY is required")
+  }
+}
+
+/* =========================
+   OpenAI
+========================= */
+
+/** buildEtymologyData.ts へ渡す JSON 生成関数。 */
+const aiGenerateJson: AiJsonGenerator = async ({
+  systemPrompt,
+  userPrompt,
+  temperature = 0,
+}) => {
+  assertOpenAIEnv()
+
+  const res = await fetch(OPENAI_API_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: OPENAI_MODEL,
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+      temperature,
+    }),
+  })
+
+  if (!res.ok) {
+    const text = await res.text()
+    throw new Error(`OPENAI_REQUEST_FAILED: ${res.status} ${text}`)
+  }
+
+  const data: unknown = await res.json()
+
+  if (
+    typeof data !== "object" ||
+    data === null ||
+    !("choices" in data) ||
+    !Array.isArray(data.choices) ||
+    data.choices.length === 0
+  ) {
+    throw new Error("OPENAI_INVALID_RESPONSE")
+  }
+
+  const firstChoice = data.choices[0]
+
+  if (
+    typeof firstChoice !== "object" ||
+    firstChoice === null ||
+    !("message" in firstChoice) ||
+    !isRecord(firstChoice.message) ||
+    !("content" in firstChoice.message)
+  ) {
+    throw new Error("OPENAI_EMPTY_MESSAGE")
+  }
+
+  const content = firstChoice.message.content
+  if (typeof content !== "string" || !content.trim()) {
+    throw new Error("OPENAI_EMPTY_CONTENT")
+  }
+
+  // buildEtymologyData 側で JSON 文字列として parse する
+  return content
+}
+
 /* =========================
    Oxford API
 ========================= */
 
 /** entries を取得する。Oxford raw は保存せず、正規化処理へ渡す。 */
 async function fetchEntries(word: string): Promise<unknown | null> {
-  console.log("OXFORD ENTRIES:", word)
+  console.log("OXFORD ENTRIES START:", word)
 
-  const res = await fetch(
-    `${BASE_URL}/entries/en-gb/${encodeURIComponent(word)}`,
-    {
-      headers: {
-        app_id: process.env.OXFORD_APP_ID ?? "",
-        app_key: process.env.OXFORD_APP_KEY ?? "",
-      },
-      cache: "no-store",
+  const url = `${BASE_URL}/entries/en-gb/${encodeURIComponent(word)}`
+  const res = await fetch(url, {
+    headers: {
+      app_id: process.env.OXFORD_APP_ID ?? "",
+      app_key: process.env.OXFORD_APP_KEY ?? "",
+    },
+    cache: "no-store",
+  })
+
+  console.log("OXFORD ENTRIES STATUS:", word, res.status)
+
+  if (!res.ok) {
+    const text = await res.text()
+    console.error("OXFORD ENTRIES FAILED:", {
+      word,
+      status: res.status,
+      body: text,
+    })
+
+    if (res.status === 429) {
+      throw new OxfordUsageLimitError()
     }
-  )
 
-  if (!res.ok) return null
-  return res.json()
+    return null
+  }
+
+  const json = await res.json()
+  console.log("OXFORD ENTRIES OK:", word)
+  return json
 }
 
 /** inflections API から活用形だけを抽出して返す。 */
@@ -209,9 +312,9 @@ async function ensureWordId(word: string): Promise<string> {
   const supabase = getSupabase()
 
   const { data, error } = await supabase
-    .from("words")
+    .from('words')
     .insert({ word })
-    .select("id")
+    .select('id')
     .single()
 
   if (error || !isRecord(data) || typeof data.id !== "string") {
@@ -294,11 +397,13 @@ async function buildNormalizedDictionary(candidate: string, entries: unknown) {
     }),
   ])
 
-  return normalizeDictionary({
+  return await normalizeDictionary({
     word: candidate,
     entries,
     inflections,
     derivatives: uniqueStrings(derivatives),
+    lexicalUnits: [], // MVP では lexical は外す。型だけ残して空配列を渡す
+    aiGenerateJson,
   })
 }
 
@@ -321,15 +426,15 @@ async function resolveFromCandidates(
       console.log("OXFORD NO ENTRIES:", candidate)
       continue
     }
-    
+
     console.log("NORMALIZE START:", candidate)
     const normalized = await buildNormalizedDictionary(candidate, entries)
     console.log("NORMALIZE DONE:", candidate)
-    
+
     console.log("REWRITE START:", candidate)
     const dictionary = await rewriteDictionary(normalized)
     console.log("REWRITE DONE:", candidate)
-    
+
     console.log("CACHE SAVE START:", candidate)
     await saveDictionary(candidate, dictionary)
     console.log("DICTIONARY CACHE SAVED:", candidate)
@@ -358,60 +463,81 @@ export type ResolveResult =
     }
 
 /** 検索本体。exact/headword -> suggestion の順で解決する。 */
-export async function resolveQuery(raw: string): Promise<ResolveResult> {
-  console.log("RESOLVE QUERY START:", raw)
+async function resolveQueryInternal(raw: string): Promise<ResolveResult> {
+  try {
+    console.log("RESOLVE QUERY START:", raw)
 
-  const input = raw.trim().toLowerCase()
-  const suggestCache: SuggestCache = new Map()
+    const input = raw.trim().toLowerCase()
+    const suggestCache: SuggestCache = new Map()
 
-  // 入力語を検索用に正規化する。
-  const normalized = normalizeWord(input)
+    const normalized = normalizeWord(input)
+    const candidates = buildLookupCandidates(normalized)
 
-  // phrase と headword の lookup 候補を作る。
-  const candidates = buildLookupCandidates(normalized)
+    const direct = await resolveFromCandidates(candidates)
 
-  // まず exact / headword 候補を順に解決する。
-  const direct = await resolveFromCandidates(candidates)
+    if (direct) {
+      return {
+        ok: true,
+        resolved: direct.resolved,
+        changed: direct.resolved !== input,
+        redirectTo: `/word/${direct.resolved}`,
+        dictionary: direct.dictionary,
+      }
+    }
 
-  if (direct) {
+    const suggestionSource = normalized.includes(" ")
+      ? normalized.split(/\s+/)[0]
+      : normalized
+
+    const suggestionBase = getLemma(suggestionSource)
+    console.log("SUGGESTION BASE:", suggestionBase)
+
+    const suggestion = await getSuggestion(suggestionBase, suggestCache)
+    if (!suggestion) {
+      console.log("NO SUGGESTION:", suggestionBase)
+      return { ok: false, reason: "NO_RESULT" }
+    }
+
+    console.log("SUGGESTION LOOKUP START:", suggestion)
+
+    const suggested = await resolveFromCandidates([suggestion])
+    if (!suggested) {
+      console.log("SUGGESTION LOOKUP FAILED:", suggestion)
+      return { ok: false, reason: "NO_RESULT" }
+    }
+
+    console.log("SUGGESTION LOOKUP DONE:", suggestion)
+
     return {
       ok: true,
-      resolved: direct.resolved,
-      changed: direct.resolved !== input,
-      redirectTo: `/word/${direct.resolved}`,
-      dictionary: direct.dictionary,
+      resolved: suggested.resolved,
+      changed: suggested.resolved !== input,
+      redirectTo: `/word/${suggested.resolved}`,
+      dictionary: suggested.dictionary,
     }
+  } catch (error) {
+    if (error instanceof OxfordUsageLimitError) {
+      console.error("OXFORD USAGE LIMIT EXCEEDED")
+      throw error
+    }
+
+    throw error
+  }
+}
+
+export async function resolveQuery(raw: string): Promise<ResolveResult> {
+  const key = normalizeWord(raw.trim().toLowerCase())
+
+  const existing = inFlightResolves.get(key)
+  if (existing) {
+    console.log("RESOLVE QUERY JOIN:", key)
+    return existing
   }
 
-  // direct で見つからなければ suggestion 用の基底語を作る。
-  const suggestionBase = normalized.includes(" ")
-    ? normalized.split(/\s+/)[0]
-    : normalized
+  const promise = resolveQueryInternal(raw).finally(() => {
+    inFlightResolves.delete(key)
+  })
 
-  // Datamuse の typo 候補を 1 件だけ試す。
-  console.log("SUGGESTION BASE:", suggestionBase)
-
-  const suggestion = await getSuggestion(suggestionBase, suggestCache)
-  if (!suggestion) {
-    console.log("NO SUGGESTION:", suggestionBase)
-    return { ok: false, reason: "NO_RESULT" }
-  }
-
-  console.log("SUGGESTION LOOKUP START:", suggestion)
-
-  const suggested = await resolveFromCandidates([suggestion])
-  if (!suggested) {
-    console.log("SUGGESTION LOOKUP FAILED:", suggestion)
-    return { ok: false, reason: "NO_RESULT" }
-  }
-
-  console.log("SUGGESTION LOOKUP DONE:", suggestion)
-
-  return {
-    ok: true,
-    resolved: suggested.resolved,
-    changed: suggested.resolved !== input,
-    redirectTo: `/word/${suggested.resolved}`,
-    dictionary: suggested.dictionary,
-  }
+  inFlightResolves.set(key, promise)
+  return promise
 }

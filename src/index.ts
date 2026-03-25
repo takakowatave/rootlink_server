@@ -44,21 +44,34 @@ app.route("/auth", auth);
  * ========================= */
 app.post("/resolve", async (c) => {
   try {
-    const body = await c.req.json();
-    const input = body?.query;
-
-    if (!input) {
-      return c.json({ error: "query required" }, 400);
+    const body = await c.req.json()
+    const result = await resolveQuery(body.query)
+    return c.json(result)
+  } catch (error) {
+    if (
+      error instanceof Error &&
+      error.name === "OxfordUsageLimitError"
+    ) {
+      return c.json(
+        {
+          ok: false,
+          reason: "UNAVAILABLE",
+        },
+        503
+      )
     }
 
-    const result = await resolveQuery(input);
-    return c.json(result);
+    console.error("RESOLVE HANDLER FAILED:", error)
 
-  } catch (err) {
-    console.error(err);
-    return c.json({ error: "resolve failed" }, 500);
+    return c.json(
+      {
+        ok: false,
+        reason: "INTERNAL_ERROR",
+      },
+      500
+    )
   }
-});
+})
 
 /* =========================
  * 5. Chat (AI Executor)

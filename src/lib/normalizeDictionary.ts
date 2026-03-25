@@ -9,9 +9,16 @@
  * - ipa / etymology を抽出する
  * - senseGroups を UI 用に整形する
  * - sense ごとの patterns を抽出する
- * - lexicalUnits を抽出する
  * - inflections / derivatives を正規化する
+ * - etymologyData を buildEtymologyData で生成する
+ *
+ * 注意
+ * - lexicalUnits の抽出はこのファイルでは行わない
+ * - lexicalUnits は外側で生成して input から受け取る
  */
+
+import { buildEtymologyData, type AiJsonGenerator } from "./buildEtymologyData.js"
+import type { EtymologyData } from "../types/etymology.js"
 
 export type NormalizedSense = {
   // sense をピン留め・クイズ出題するための安定ID
@@ -44,7 +51,6 @@ export type NormalizedLexicalUnit = {
   contexts: NormalizedLexicalUnitContext[]
 }
 
-
 export type NormalizedDictionary = {
   word: string
   ipa: string | null
@@ -53,6 +59,7 @@ export type NormalizedDictionary = {
   lexicalUnits: NormalizedLexicalUnit[]
   derivatives: string[]
   etymology: string | null
+  etymologyData: EtymologyData | null
 }
 
 export type NormalizeDictionaryInput = {
@@ -60,6 +67,8 @@ export type NormalizeDictionaryInput = {
   entries: unknown
   inflections: string[]
   derivatives: string[]
+  lexicalUnits: NormalizedLexicalUnit[]
+  aiGenerateJson?: AiJsonGenerator
 }
 
 /**
@@ -76,10 +85,6 @@ type OxfordPronunciation = {
   phoneticSpelling?: string
 }
 
-type OxfordConstruction = {
-  text?: string
-}
-
 type OxfordNote = {
   type?: string
   text?: string
@@ -94,7 +99,6 @@ type OxfordSense = {
   definitions?: string[]
   shortDefinitions?: string[]
   examples?: OxfordExample[]
-  constructions?: OxfordConstruction[]
   notes?: OxfordNote[]
   subsenses?: OxfordSense[]
   registers?: OxfordTextValue[]
@@ -122,15 +126,6 @@ type OxfordResult = {
   word?: string
   text?: string
   lexicalEntries?: OxfordLexicalEntry[]
-}
-
-type LexicalUnitCandidate = {
-  text: string
-  sourceType: "construction" | "wordFormNote" | "example"
-  sourceText: string | null
-  parentDefinition: string | null
-  parentExample: string | null
-  partOfSpeech: string | null
 }
 
 /**
@@ -216,18 +211,6 @@ function readPronunciation(value: unknown): OxfordPronunciation | null {
 }
 
 /**
- * construction を読む。
- */
-function readConstruction(value: unknown): OxfordConstruction | null {
-  if (!isRecord(value)) return null
-
-  const text = readString(value.text)
-  if (!text) return null
-
-  return { text }
-}
-
-/**
  * note を読む。
  */
 function readNote(value: unknown): OxfordNote | null {
@@ -263,7 +246,7 @@ function readExample(value: unknown): OxfordExample | null {
 
 /**
  * sense を読む。
- * definitions / examples / constructions / notes / subsenses /
+ * definitions / examples / notes / subsenses /
  * registers / domains をここで安全な内部型に寄せる。
  */
 function readSense(value: unknown): OxfordSense | null {
@@ -272,7 +255,6 @@ function readSense(value: unknown): OxfordSense | null {
   const definitions = readStringArray(value.definitions)
   const shortDefinitions = readStringArray(value.shortDefinitions)
   const examples = readArray(value.examples, readExample)
-  const constructions = readArray(value.constructions, readConstruction)
   const notes = readArray(value.notes, readNote)
   const subsenses = readArray(value.subsenses, readSense)
   const registers = readArray(value.registers, readTextValue)
@@ -282,7 +264,6 @@ function readSense(value: unknown): OxfordSense | null {
     definitions.length === 0 &&
     shortDefinitions.length === 0 &&
     examples.length === 0 &&
-    constructions.length === 0 &&
     notes.length === 0 &&
     subsenses.length === 0 &&
     registers.length === 0 &&
@@ -295,7 +276,6 @@ function readSense(value: unknown): OxfordSense | null {
     definitions: definitions.length > 0 ? definitions : undefined,
     shortDefinitions: shortDefinitions.length > 0 ? shortDefinitions : undefined,
     examples: examples.length > 0 ? examples : undefined,
-    constructions: constructions.length > 0 ? constructions : undefined,
     notes: notes.length > 0 ? notes : undefined,
     subsenses: subsenses.length > 0 ? subsenses : undefined,
     registers: registers.length > 0 ? registers : undefined,
@@ -474,9 +454,7 @@ function getTextValueText(value: OxfordTextValue): string {
  * ipa を抽出する。
  * lexicalEntry 側を先に見て、なければ entry 側を見る。
  */
-function extractIPA(data: unknown, word: string): string | null {
-  const lexicalEntries = getLexicalEntries(data, word)
-
+function extractIPA(lexicalEntries: OxfordLexicalEntry[]): string | null {
   const fromLexicalEntry = lexicalEntries
     .flatMap((lexicalEntry) => lexicalEntry.pronunciations ?? [])
     .map((pronunciation) => pronunciation.phoneticSpelling ?? "")
@@ -497,9 +475,7 @@ function extractIPA(data: unknown, word: string): string | null {
  * etymology を抽出する。
  * entry 側優先、なければ lexicalEntry 側。
  */
-function extractEtymology(data: unknown, word: string): string | null {
-  const lexicalEntries = getLexicalEntries(data, word)
-
+function extractEtymology(lexicalEntries: OxfordLexicalEntry[]): string | null {
   const fromEntry = lexicalEntries
     .flatMap((lexicalEntry) => getEntries(lexicalEntry))
     .flatMap((entry) => entry.etymologies ?? [])
@@ -542,55 +518,8 @@ function extractPrimaryExample(sense: OxfordSense): string | null {
 /**
  * patterns ラベル表示用の軽い正規化。
  */
-function normalizepatternsLabel(text: string): string {
+function normalizePatternsLabel(text: string): string {
   return text.replace(/"/g, "").replace(/\s+/g, " ").trim()
-}
-
-/**
- * pattern / lexicalUnit 表示用の軽い正規化。
- */
-function normalizePattern(text: string): string {
-  return text
-    .replace(/"/g, "")
-    .replace(/,.*$/, "")
-    .replace(/^usually\s+/i, "")
-    .replace(/\s+/g, " ")
-    .trim()
-}
-
-/**
- * sense ごとの patterns を作る。
- * 取得元
- * - registers
- * - domains
- * - notes
- * - constructions
- */
-function extractpatternsLabels(sense: OxfordSense, word: string): string[] {
-  const lowerWord = word.trim().toLowerCase()
-
-  const registers = (sense.registers ?? [])
-    .map((item) => normalizepatternsLabel(getTextValueText(item)))
-    .filter((value) => value.length > 0)
-
-  const domains = (sense.domains ?? [])
-    .map((item) => normalizepatternsLabel(getTextValueText(item)))
-    .filter((value) => value.length > 0)
-
-  const noteLabels = (sense.notes ?? [])
-    .map((note) => normalizepatternsLabel(note.text ?? ""))
-    .filter((value) => value.length > 0)
-
-  const constructionLabels = (sense.constructions ?? [])
-    .map((construction) => normalizePattern(construction.text ?? ""))
-    .filter((value) => value.length > 0)
-
-  return uniqueStrings([
-    ...registers,
-    ...domains,
-    ...noteLabels,
-    ...constructionLabels,
-  ]).filter((value) => value.toLowerCase() !== lowerWord)
 }
 
 /**
@@ -599,7 +528,6 @@ function extractpatternsLabels(sense: OxfordSense, word: string): string[] {
  */
 function flattenSenses(lexicalEntry: OxfordLexicalEntry): OxfordSense[] {
   const baseSenses = getEntries(lexicalEntry).flatMap((entry) => getSenses(entry))
-
   return baseSenses.flatMap((sense) => [sense, ...(sense.subsenses ?? [])])
 }
 
@@ -618,51 +546,76 @@ function normalizePartOfSpeech(lexicalEntry: OxfordLexicalEntry): string {
 }
 
 /**
+ * sense ごとの patterns ラベルを作る。
+ *
+ * 方針
+ * - sense ラベルには補助情報だけ残す
+ * - lexicalUnit として見せたい constructions はここでは混ぜない
+ *
+ * 残すもの
+ * - registers
+ * - domains
+ * - notes
+ */
+function extractPatternsLabels(sense: OxfordSense, word: string): string[] {
+  const lowerWord = word.trim().toLowerCase()
+
+  const registers = (sense.registers ?? [])
+    .map((item) => normalizePatternsLabel(getTextValueText(item)))
+    .filter((value) => value.length > 0)
+
+  const domains = (sense.domains ?? [])
+    .map((item) => normalizePatternsLabel(getTextValueText(item)))
+    .filter((value) => value.length > 0)
+
+  const noteLabels = (sense.notes ?? [])
+    .map((note) => normalizePatternsLabel(note.text ?? ""))
+    .filter((value) => value.length > 0)
+
+  return uniqueStrings([
+    ...registers,
+    ...domains,
+    ...noteLabels,
+  ]).filter((value) => value.toLowerCase() !== lowerWord)
+}
+
+/**
  * Oxford raw を senseGroups に整形する。
  * ここで definition / example / patterns を sense 単位にまとめる。
  */
-function extractSenseGroups(data: unknown, word: string): NormalizedSenseGroup[] {
-  const lexicalEntries = getLexicalEntries(data, word)
-
+function extractSenseGroups(
+  lexicalEntries: OxfordLexicalEntry[],
+  word: string
+): NormalizedSenseGroup[] {
   const posMap = new Map<
     string,
-    Array<{ definition: string; example: string | null; patterns: string[] }>
+    Array<{ definition: string; example: string; patterns: string[] }>
   >()
 
   for (const lexicalEntry of lexicalEntries) {
     const partOfSpeech = normalizePartOfSpeech(lexicalEntry)
     if (!partOfSpeech) continue
 
-    const flattened = flattenSenses(lexicalEntry)
+    let bucket = posMap.get(partOfSpeech)
+    if (!bucket) {
+      bucket = []
+      posMap.set(partOfSpeech, bucket)
+    }
 
-    const items = flattened
-      .map((sense) => {
-        const definition = extractPrimaryDefinition(sense)
-        const example = extractPrimaryExample(sense)
-        const patterns = extractpatternsLabels(sense, word)
+    for (const sense of flattenSenses(lexicalEntry)) {
+      const definition = extractPrimaryDefinition(sense)
+      const example = extractPrimaryExample(sense)
+      const patterns = extractPatternsLabels(sense, word)
 
-        if (!definition && !example) return null
+      // 例文がない sense は UI に出さない
+      if (!example) continue
 
-        return {
-          definition: definition ?? "",
-          example,
-          patterns,
-        }
+      bucket.push({
+        definition: definition ?? "",
+        example,
+        patterns,
       })
-      .filter(
-        (
-          item
-        ): item is {
-          definition: string
-          example: string | null
-          patterns: string[]
-        } => item !== null
-      )
-
-    if (items.length === 0) continue
-
-    const existing = posMap.get(partOfSpeech) ?? []
-    posMap.set(partOfSpeech, [...existing, ...items])
+    }
   }
 
   return [...posMap.entries()].map(([partOfSpeech, rawSenses]) => {
@@ -686,212 +639,155 @@ function extractSenseGroups(data: unknown, word: string): NormalizedSenseGroup[]
 }
 
 /**
- * lexicalUnitId 用の安定IDを作る。
+ * lexicalUnit context を安全な shape に寄せる。
  */
-function toStableId(text: string): string {
-  return text
-    .trim()
-    .toLowerCase()
-    .replace(/['’]/g, "")
-    .replace(/[^a-z0-9]+/g, "_")
-    .replace(/^_+|_+$/g, "")
-}
+function normalizeExternalLexicalUnitContext(
+  context: NormalizedLexicalUnitContext
+): NormalizedLexicalUnitContext | null {
+  const { sourceType } = context
 
-/**
- * examples から "agree with" のような表現を拾うための regex。
- */
-function buildPatternRegex(target: string): RegExp {
-  return new RegExp(
-    `\\b${target}\\s+(with|to|on|about|for|of|in|at|from|that|into|over|under|around|through|after|against|between|by|across|among|upon)\\b`,
-    "gi"
-  )
-}
-
-/**
- * lexicalUnit 候補文字列を collected に積む。
- */
-function collectLexicalUnitCandidate(
-  collected: LexicalUnitCandidate[],
-  input: {
-    text: string
-    sourceType: "construction" | "wordFormNote" | "example"
-    sourceText: string | null
-    parentDefinition: string | null
-    parentExample: string | null
-    partOfSpeech: string | null
-  },
-  word: string
-): void {
-  const normalized = normalizePattern(input.text)
-  if (!normalized) return
-  if (normalized.toLowerCase() === word.toLowerCase()) return
-
-  collected.push({
-    text: normalized,
-    sourceType: input.sourceType,
-    sourceText: input.sourceText,
-    parentDefinition: input.parentDefinition,
-    parentExample: input.parentExample,
-    partOfSpeech: input.partOfSpeech,
-  })
-}
-
-/**
- * 1 sense から lexicalUnit 候補を集める。
- * 優先順
- * - constructions
- * - wordFormNote
- * - examples
- */
-function collectFromSense(
-  sense: OxfordSense,
-  regex: RegExp,
-  word: string,
-  partOfSpeech: string | null,
-  collected: LexicalUnitCandidate[]
-): void {
-  const parentDefinition = extractPrimaryDefinition(sense)
-  const parentExample = extractPrimaryExample(sense)
-
-  for (const construction of sense.constructions ?? []) {
-    const sourceText = construction.text ?? ""
-
-    collectLexicalUnitCandidate(
-      collected,
-      {
-        text: sourceText,
-        sourceType: "construction",
-        sourceText,
-        parentDefinition,
-        parentExample,
-        partOfSpeech,
-      },
-      word
-    )
+  if (
+    sourceType !== "construction" &&
+    sourceType !== "wordFormNote" &&
+    sourceType !== "example"
+  ) {
+    return null
   }
 
-  for (const note of sense.notes ?? []) {
-    if (note.type !== "wordFormNote") continue
-
-    const sourceText = note.text ?? ""
-
-    collectLexicalUnitCandidate(
-      collected,
-      {
-        text: sourceText,
-        sourceType: "wordFormNote",
-        sourceText,
-        parentDefinition,
-        parentExample,
-        partOfSpeech,
-      },
-      word
-    )
+  return {
+    sourceType,
+    sourceText: context.sourceText ?? null,
+    parentDefinition: context.parentDefinition ?? null,
+    parentExample: context.parentExample ?? null,
+    partOfSpeech: context.partOfSpeech ?? null,
   }
+}
 
-  for (const example of sense.examples ?? []) {
-    const sourceText = example.text ?? ""
-    if (!sourceText) continue
+/**
+ * lexicalUnit context の重複判定キーを作る。
+ */
+function buildLexicalUnitContextKey(
+  context: NormalizedLexicalUnitContext
+): string {
+  return [
+    context.sourceType,
+    context.sourceText ?? "",
+    context.parentDefinition ?? "",
+    context.parentExample ?? "",
+    context.partOfSpeech ?? "",
+  ].join("||")
+}
 
-    const matches = sourceText.match(regex)
-    if (!matches) continue
+/**
+ * lexicalUnits は外部生成なので、このファイルでは
+ * - 文字列の基本正規化
+ * - context の重複排除
+ * だけを行う。
+ */
+function normalizeExternalLexicalUnits(
+  lexicalUnits: NormalizedLexicalUnit[]
+): NormalizedLexicalUnit[] {
+  const grouped = new Map<string, NormalizedLexicalUnit>()
 
-    for (const match of matches) {
-      collectLexicalUnitCandidate(
-        collected,
-        {
-          text: match,
-          sourceType: "example",
-          sourceText,
-          parentDefinition,
-          parentExample,
-          partOfSpeech,
-        },
-        word
-      )
+  for (const lexicalUnit of lexicalUnits) {
+    const lexicalUnitId = readString(lexicalUnit.lexicalUnitId)
+    const text = readString(lexicalUnit.text)
+
+    if (!lexicalUnitId || !text) continue
+
+    const incomingContexts = Array.isArray(lexicalUnit.contexts)
+      ? lexicalUnit.contexts
+          .map((context) => normalizeExternalLexicalUnitContext(context))
+          .filter(
+            (context): context is NormalizedLexicalUnitContext => context !== null
+          )
+      : []
+
+    const existing = grouped.get(lexicalUnitId)
+
+    if (!existing) {
+      const seen = new Set<string>()
+      const dedupedContexts: NormalizedLexicalUnitContext[] = []
+
+      for (const context of incomingContexts) {
+        const key = buildLexicalUnitContextKey(context)
+        if (seen.has(key)) continue
+        seen.add(key)
+        dedupedContexts.push(context)
+      }
+
+      grouped.set(lexicalUnitId, {
+        lexicalUnitId,
+        text,
+        contexts: dedupedContexts,
+      })
+      continue
     }
-  }
-}
 
-/**
- * lexicalUnits を抽出する。
- */
-function extractLexicalUnits(data: unknown, word: string): NormalizedLexicalUnit[] {
-  const lexicalEntries = getLexicalEntries(data, word)
-  const collected: LexicalUnitCandidate[] = []
-  const target = word.trim().toLowerCase()
-
-  if (!target) return []
-
-  const regex = buildPatternRegex(target)
-
-  for (const lexicalEntry of lexicalEntries) {
-    const partOfSpeech = normalizePartOfSpeech(lexicalEntry) || null
-
-    for (const sense of flattenSenses(lexicalEntry)) {
-      collectFromSense(sense, regex, word, partOfSpeech, collected)
-    }
-  }
-
-  const grouped = new Map<string, LexicalUnitCandidate[]>()
-
-  for (const candidate of collected) {
-    const key = candidate.text.toLowerCase()
-    const existing = grouped.get(key) ?? []
-    grouped.set(key, [...existing, candidate])
-  }
-
-  return [...grouped.values()].map((candidates) => {
-    const text = candidates[0].text
-
-    const contexts = candidates.reduce<NormalizedLexicalUnitContext[]>(
-      (acc, candidate) => {
-        const context: NormalizedLexicalUnitContext = {
-          sourceType: candidate.sourceType,
-          sourceText: candidate.sourceText,
-          parentDefinition: candidate.parentDefinition,
-          parentExample: candidate.parentExample,
-          partOfSpeech: candidate.partOfSpeech,
-        }
-
-        const exists = acc.some(
-          (item) =>
-            item.sourceType === context.sourceType &&
-            item.sourceText === context.sourceText &&
-            item.parentDefinition === context.parentDefinition &&
-            item.parentExample === context.parentExample &&
-            item.partOfSpeech === context.partOfSpeech
-        )
-
-        return exists ? acc : [...acc, context]
-      },
-      []
+    const seen = new Set(
+      existing.contexts.map((context) => buildLexicalUnitContextKey(context))
     )
 
-    return {
-      lexicalUnitId: toStableId(text),
-      text,
-      contexts,
+    const mergedContexts = [...existing.contexts]
+
+    for (const context of incomingContexts) {
+      const key = buildLexicalUnitContextKey(context)
+      if (seen.has(key)) continue
+      seen.add(key)
+      mergedContexts.push(context)
     }
-  })
+
+    grouped.set(lexicalUnitId, {
+      lexicalUnitId,
+      text: existing.text,
+      contexts: mergedContexts,
+    })
+  }
+
+  return [...grouped.values()]
 }
 
 /**
  * normalizeDictionary の本体。
  * Oxford raw + 補助データを RootLink 用の NormalizedDictionary にまとめる。
+ *
+ * 注意
+ * - buildEtymologyData を await するため async
+ * - lexicalUnits は input から受け取る
  */
-export function normalizeDictionary(
+export async function normalizeDictionary(
   input: NormalizeDictionaryInput
-): NormalizedDictionary {
-  const { word, entries, inflections, derivatives } = input
+): Promise<NormalizedDictionary> {
+  const {
+    word,
+    entries,
+    inflections,
+    derivatives,
+    lexicalUnits,
+    aiGenerateJson,
+  } = input
+
+  const lexicalEntries = getLexicalEntries(entries, word)
+  const normalizedInflections = uniqueStrings(inflections)
+  const normalizedDerivatives = uniqueStrings(derivatives)
+  const normalizedLexicalUnits = normalizeExternalLexicalUnits(lexicalUnits)
+  const etymology = extractEtymology(lexicalEntries)
+
+  // etymologyData を常に生成する（AIは使わない）
+  const etymologyData = await buildEtymologyData({
+    headword: word,
+    rawEtymology: etymology,
+    wordFamily: normalizedDerivatives,
+  })
 
   return {
     word,
-    ipa: extractIPA(entries, word),
-    inflections: uniqueStrings(inflections),
-    senseGroups: extractSenseGroups(entries, word),
-    lexicalUnits: extractLexicalUnits(entries, word),
-    derivatives: uniqueStrings(derivatives),
-    etymology: extractEtymology(entries, word),
+    ipa: extractIPA(lexicalEntries),
+    inflections: normalizedInflections,
+    senseGroups: extractSenseGroups(lexicalEntries, word),
+    lexicalUnits: normalizedLexicalUnits,
+    derivatives: normalizedDerivatives,
+    etymology,
+    etymologyData,
   }
 }

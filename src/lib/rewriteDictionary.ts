@@ -18,6 +18,7 @@ import type {
   NormalizedLexicalUnit,
   NormalizedLexicalUnitContext,
 } from "./normalizeDictionary.js"
+import type { EtymologyData } from "../types/etymology.js"
 
 export type RewrittenSense = {
   senseId: string
@@ -61,6 +62,7 @@ export type RewrittenDictionary = {
   lexicalUnits: RewrittenLexicalUnit[]
   derivatives: string[]
   etymology: string | null
+  etymologyData: EtymologyData | null
 }
 
 type RewriteSourceItem = {
@@ -177,7 +179,9 @@ function buildSenseRewritePrompt(items: RewriteSourceItem[]): string {
   ].join("\n")
 }
 
-async function postOpenAI(messages: { role: "system" | "user"; content: string }[]): Promise<string> {
+async function postOpenAI(
+  messages: { role: "system" | "user"; content: string }[]
+): Promise<string> {
   assertEnv()
 
   const res = await fetch(OPENAI_API_URL, {
@@ -251,21 +255,32 @@ async function rewriteChunk(items: RewriteSourceItem[]): Promise<OpenAIRewriteIt
   return parsed.items
 }
 
+function buildLexicalUnitContextKey(
+  context: NormalizedLexicalUnitContext
+): string {
+  return [
+    context.sourceType,
+    context.sourceText ?? "",
+    context.parentDefinition ?? "",
+    context.parentExample ?? "",
+    context.partOfSpeech ?? "",
+  ].join("||")
+}
+
 function normaliseLexicalUnitContexts(
   contexts: NormalizedLexicalUnitContext[]
 ): NormalizedLexicalUnitContext[] {
-  return contexts.reduce<NormalizedLexicalUnitContext[]>((acc, context) => {
-    const exists = acc.some(
-      (item) =>
-        item.sourceType === context.sourceType &&
-        item.sourceText === context.sourceText &&
-        item.parentDefinition === context.parentDefinition &&
-        item.parentExample === context.parentExample &&
-        item.partOfSpeech === context.partOfSpeech
-    )
+  const seen = new Set<string>()
+  const deduped: NormalizedLexicalUnitContext[] = []
 
-    return exists ? acc : [...acc, context]
-  }, [])
+  for (const context of contexts) {
+    const key = buildLexicalUnitContextKey(context)
+    if (seen.has(key)) continue
+    seen.add(key)
+    deduped.push(context)
+  }
+
+  return deduped
 }
 
 function buildLexicalUnitPrompt(
@@ -385,6 +400,10 @@ async function rewriteLexicalUnits(
   word: string,
   lexicalUnits: NormalizedLexicalUnit[]
 ): Promise<RewrittenLexicalUnit[]> {
+  if (lexicalUnits.length === 0) {
+    return []
+  }
+
   const results: RewrittenLexicalUnit[] = []
 
   for (const unit of lexicalUnits) {
@@ -452,5 +471,6 @@ export async function rewriteDictionary(
     lexicalUnits: rewrittenLexicalUnits,
     derivatives: data.derivatives,
     etymology: data.etymology,
+    etymologyData: data.etymologyData,
   }
 }

@@ -9,7 +9,7 @@ function isWordToken(s) {
 /* =========================
    Oxford Sandbox Base URL
 ========================= */
-const BASE_URL = "https://od-api-sandbox.oxforddictionaries.com/api/v2";
+const BASE_URL = "https://od-api.oxforddictionaries.com/api/v2";
 /* =========================
    Oxford API 呼び出し
 ========================= */
