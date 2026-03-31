@@ -215,27 +215,54 @@ export const ORIGIN_LANGUAGES: OriginLanguageMeta[] = [
 ]
 
 // raw etymology から最初に見つかった由来言語を返す
+// raw etymology から source 寄りの由来言語を返す
 export function extractOriginLanguage(
-  rawEtymology: string
-): OriginLanguageResult | null {
-  const lower = rawEtymology.toLowerCase()
-
-  for (const language of ORIGIN_LANGUAGES) {
-    const matched = language.aliases.some((alias) =>
-      lower.includes(alias.toLowerCase())
-    )
-
-    if (matched) {
-      return {
-        key: language.key,
-        labelEn: language.labelEn,
-        labelJa: language.labelJa,
+    rawEtymology: string
+  ): OriginLanguageResult | null {
+    const lower = rawEtymology.toLowerCase()
+  
+    // まず "from Latin", "based on Greek", "via Old French" のような
+    // source 導入句の直後に出る言語を優先する
+    for (const language of ORIGIN_LANGUAGES) {
+      const matched = language.aliases.some((alias) => {
+        const escaped = escapeRegExp(alias.toLowerCase())
+        const pattern = new RegExp(
+          `\\b(?:from|based on|related to|ultimately from|via)\\s+${escaped}\\b`,
+          "i"
+        )
+        return pattern.test(lower)
+      })
+  
+      if (matched) {
+        return {
+          key: language.key,
+          labelEn: language.labelEn,
+          labelJa: language.labelJa,
+        }
       }
     }
+  
+    // 導入句で取れなければ従来どおり全体から拾う
+    for (const language of ORIGIN_LANGUAGES) {
+      const matched = language.aliases.some((alias) =>
+        lower.includes(alias.toLowerCase())
+      )
+  
+      if (matched) {
+        return {
+          key: language.key,
+          labelEn: language.labelEn,
+          labelJa: language.labelJa,
+        }
+      }
+    }
+  
+    return null
   }
-
-  return null
-}
+  
+  function escapeRegExp(value: string): string {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+  }
 
 // buildEtymologyData 側で sourceWord の前置き除去に使う
 export function getOriginLanguageAliases(): string[] {

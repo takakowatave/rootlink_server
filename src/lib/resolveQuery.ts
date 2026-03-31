@@ -2,7 +2,7 @@ import { normalizeWord } from "./normalize.js"
 import { getSupabase } from "../lib/supabase.js"
 import { generateDerivatives } from "../lib/generateDerivatives.js"
 import { normalizeDictionary } from "../lib/normalizeDictionary.js"
-import type { AiJsonGenerator } from "./buildEtymologyData.js"
+import { buildEtymologyData } from "./buildEtymologyData.js"
 import {
   rewriteDictionary,
   type RewrittenDictionary,
@@ -89,67 +89,7 @@ function assertOpenAIEnv(): void {
    OpenAI
 ========================= */
 
-/** buildEtymologyData.ts へ渡す JSON 生成関数。 */
-const aiGenerateJson: AiJsonGenerator = async ({
-  systemPrompt,
-  userPrompt,
-  temperature = 0,
-}) => {
-  assertOpenAIEnv()
 
-  const res = await fetch(OPENAI_API_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-    },
-    body: JSON.stringify({
-      model: OPENAI_MODEL,
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt },
-      ],
-      temperature,
-    }),
-  })
-
-  if (!res.ok) {
-    const text = await res.text()
-    throw new Error(`OPENAI_REQUEST_FAILED: ${res.status} ${text}`)
-  }
-
-  const data: unknown = await res.json()
-
-  if (
-    typeof data !== "object" ||
-    data === null ||
-    !("choices" in data) ||
-    !Array.isArray(data.choices) ||
-    data.choices.length === 0
-  ) {
-    throw new Error("OPENAI_INVALID_RESPONSE")
-  }
-
-  const firstChoice = data.choices[0]
-
-  if (
-    typeof firstChoice !== "object" ||
-    firstChoice === null ||
-    !("message" in firstChoice) ||
-    !isRecord(firstChoice.message) ||
-    !("content" in firstChoice.message)
-  ) {
-    throw new Error("OPENAI_EMPTY_MESSAGE")
-  }
-
-  const content = firstChoice.message.content
-  if (typeof content !== "string" || !content.trim()) {
-    throw new Error("OPENAI_EMPTY_CONTENT")
-  }
-
-  // buildEtymologyData 側で JSON 文字列として parse する
-  return content
-}
 
 /* =========================
    Oxford API
@@ -403,7 +343,6 @@ async function buildNormalizedDictionary(candidate: string, entries: unknown) {
     inflections,
     derivatives: uniqueStrings(derivatives),
     lexicalUnits: [], // MVP では lexical は外す。型だけ残して空配列を渡す
-    aiGenerateJson,
   })
 }
 

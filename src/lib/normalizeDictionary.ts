@@ -771,14 +771,18 @@ export async function normalizeDictionary(
   const normalizedInflections = uniqueStrings(inflections)
   const normalizedDerivatives = uniqueStrings(derivatives)
   const normalizedLexicalUnits = normalizeExternalLexicalUnits(lexicalUnits)
-  const etymology = extractEtymology(lexicalEntries)
+// Oxford から語源文を取る
+const extractedEtymology = extractEtymology(lexicalEntries)
 
-  // etymologyData を常に生成する（AIは使わない）
-  const etymologyData = await buildEtymologyData({
-    headword: word,
-    rawEtymology: etymology,
-    wordFamily: normalizedDerivatives,
-  })
+// Oxford に語源文がなくても memory hook 生成を止めない
+const etymology = extractedEtymology || `from ${word}`
+
+// etymologyData を常に生成する（AIは使わない）
+const etymologyData = await buildEtymologyData({
+  headword: word,
+  rawEtymology: etymology,
+  wordFamily: normalizedDerivatives,
+})
 
   return {
     word,

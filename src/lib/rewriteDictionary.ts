@@ -4,7 +4,7 @@
  * 役割:
  * - normalizeDictionary の結果を受け取る
  * - definition / example を OpenAI で learner-friendly な英語に書き換える
- * - lexicalUnits は contexts を使って AI で meaning を生成する
+ * - その確定英語から日本語を生成する
  * - その結果を、dictionary_cache に保存する完成JSONとして返す
  *
  * 注意:
@@ -13,21 +13,34 @@
  * - 呼び出し側で try/catch してください
  */
 
-import type {
-  NormalizedDictionary,
-  NormalizedLexicalUnit,
-  NormalizedLexicalUnitContext,
-} from "./normalizeDictionary.js"
+import type { NormalizedDictionary } from "./normalizeDictionary.js"
 import type { EtymologyData } from "../types/etymology.js"
 
+// MVP で使う対応言語を表す。
+type SupportedLocale = "ja"
+
+// 英語本文と翻訳群をまとめる共通 shape。
+export type LocalizedText = {
+  en: string
+  translations: Partial<Record<SupportedLocale, string>>
+}
+
+// 英語例文と翻訳群をまとめる共通 shape。
+export type LocalizedExample = {
+  en: string | null
+  translations: Partial<Record<SupportedLocale, string | null>>
+}
+
+// 1 sense 分の保存 shape を表す。
 export type RewrittenSense = {
   senseId: string
   senseNumber: string
-  definition: string
-  example: string | null
+  definition: LocalizedText
+  example: LocalizedExample
   patterns: string[]
 }
 
+// 品詞ごとの sense 配列を表す。
 export type RewrittenSenseGroup = {
   partOfSpeech: string
   totalSenseCount: number
@@ -36,81 +49,78 @@ export type RewrittenSenseGroup = {
   senses: RewrittenSense[]
 }
 
-export type RewrittenLexicalUnitMeaning = {
-  meaning: {
-    en: string
-    ja: string
-  }
-  examples: {
-    sentence: string
-    translation: string
-  }[]
-}
-
-export type RewrittenLexicalUnit = {
-  lexicalUnitId: string
-  phrase: string
-  meanings: RewrittenLexicalUnitMeaning[]
-}
-
+// dictionary_cache に保存する完成 JSON 全体を表す。
 export type RewrittenDictionary = {
   schemaVersion: number
   word: string
   ipa: string | null
   inflections: string[]
   senseGroups: RewrittenSenseGroup[]
-  lexicalUnits: RewrittenLexicalUnit[]
   derivatives: string[]
   etymology: string | null
   etymologyData: EtymologyData | null
 }
 
+// 英語 rewrite に渡す入力 1 件を表す。
 type RewriteSourceItem = {
   id: string
   sourceDefinition: string
   sourceExample: string | null
 }
 
-type OpenAIRewriteItem = {
+// 日本語生成に渡す入力 1 件を表す。
+type TranslationSourceItem = {
   id: string
-  definition: string
+  definitionEn: string
+  exampleEn: string | null
+}
+
+// 英語 rewrite の OpenAI 返却 1 件を表す。
+type OpenAIRewriteItem = {
+  id?: string
+  definition?: string
   example?: string | null
 }
 
+// 英語 rewrite の OpenAI 返却全体を表す。
 type OpenAIRewriteResponse = {
   items?: OpenAIRewriteItem[]
 }
 
-type OpenAILexicalUnitExample = {
-  sentence?: string
-  translation?: string
+// 日本語生成の OpenAI 返却 1 件を表す。
+type OpenAITranslationItem = {
+  id?: string
+  definitionJa?: string
+  exampleJa?: string | null
 }
 
-type OpenAILexicalUnitMeaning = {
-  en?: string
-  ja?: string
-  examples?: OpenAILexicalUnitExample[]
+// 日本語生成の OpenAI 返却全体を表す。
+type OpenAITranslationResponse = {
+  items?: OpenAITranslationItem[]
 }
 
-type OpenAILexicalUnitResponse = {
-  meanings?: OpenAILexicalUnitMeaning[]
-}
-
+// OpenAI API の URL を決める。
 const OPENAI_API_URL =
   process.env.OPENAI_API_URL ?? "https://api.openai.com/v1/chat/completions"
 
+// OpenAI で使うモデル名を決める。
 const OPENAI_MODEL =
   process.env.OPENAI_TEXT_MODEL ?? process.env.OPENAI_MODEL ?? "gpt-4.1-mini"
 
+// OpenAI に投げる chunk サイズを決める。
 const CHUNK_SIZE = 12
-const SCHEMA_VERSION = 1
 
+// 保存 JSON の schema version を決める。
+const SCHEMA_VERSION = 2
+
+// OpenAI 用の必須 env があるか確認する。
 function assertEnv(): void {
   if (!process.env.OPENAI_API_KEY) {
     throw new Error("OPENAI_API_KEY is required")
   }
 }
 
+// 配列を一定件数ずつに分割する。
 function chunk<T>(items: T[], size: number): T[][] {
   const out: T[][] = []
 
@@ -121,6 +131,7 @@ function chunk<T>(items: T[], size: number): T[][] {
   return out
 }
 
+// OpenAI の code fence を外して JSON を読みやすくする。
 function stripCodeFence(text: string): string {
   return text
     .replace(/^```json\s*/i, "")
@@ -129,14 +140,17 @@ function stripCodeFence(text: string): string {
     .trim()
 }
 
+// JSON 文字列を安全に parse する。
 function safeJsonParse<T>(text: string): T {
   return JSON.parse(stripCodeFence(text)) as T
 }
 
+// unknown から空文字安全な string を読む。
 function readString(value: unknown): string {
   return typeof value === "string" ? value.trim() : ""
 }
 
+// normalizeDictionary の senses を英語 rewrite 用入力に並べ替える。
 function buildRewriteSources(data: NormalizedDictionary): RewriteSourceItem[] {
   const items: RewriteSourceItem[] = []
 
@@ -145,7 +159,7 @@ function buildRewriteSources(data: NormalizedDictionary): RewriteSourceItem[] {
       if (!sense.definition.trim()) continue
 
       items.push({
-        id: `${group.partOfSpeech}-${sense.senseNumber}`,
+        id: sense.senseId,
         sourceDefinition: sense.definition,
         sourceExample: sense.example ?? null,
       })
@@ -155,6 +169,34 @@ function buildRewriteSources(data: NormalizedDictionary): RewriteSourceItem[] {
   return items
 }
 
+// 確定した英語 definition / example を日本語生成用入力に並べる。
+function buildTranslationSources(
+  data: NormalizedDictionary,
+  rewrittenMap: Map<string, OpenAIRewriteItem>
+): TranslationSourceItem[] {
+  const items: TranslationSourceItem[] = []
+
+  for (const group of data.senseGroups) {
+    for (const sense of group.senses) {
+      const rewritten = rewrittenMap.get(sense.senseId)
+
+      const definitionEn = readString(rewritten?.definition) || sense.definition
+      const exampleEn = readString(rewritten?.example) || sense.example || null
+
+      if (!definitionEn.trim()) continue
+
+      items.push({
+        id: sense.senseId,
+        definitionEn,
+        exampleEn,
+      })
+    }
+  }
+
+  return items
+}
+
+// 英語 rewrite 用の OpenAI prompt を組み立てる。
 function buildSenseRewritePrompt(items: RewriteSourceItem[]): string {
   return [
     "Rewrite English dictionary definitions and examples for an English-learning product.",
@@ -179,6 +221,31 @@ function buildSenseRewritePrompt(items: RewriteSourceItem[]): string {
   ].join("\n")
 }
 
+// 日本語生成用の OpenAI prompt を組み立てる。
+function buildSenseTranslationPrompt(items: TranslationSourceItem[]): string {
+  return [
+    "Translate learner-friendly English dictionary content into natural Japanese for Japanese learners of English.",
+    "Rules:",
+    "- Keep the meaning faithful to the English input.",
+    "- Write concise, natural Japanese.",
+    "- Do not add information that is not in the English input.",
+    "- If example is empty, return null for exampleJa.",
+    "- Return JSON only.",
+    "",
+    'Output format: {"items":[{"id":"...","definitionJa":"...","exampleJa":"..."|null}]}',
+    "",
+    "Input:",
+    JSON.stringify(
+      items.map((item) => ({
+        id: item.id,
+        definitionEn: item.definitionEn,
+        exampleEn: item.exampleEn,
+      }))
+    ),
+  ].join("\n")
+}
+
+// OpenAI Chat Completions に POST して本文を返す。
 async function postOpenAI(
   messages: { role: "system" | "user"; content: string }[]
 ): Promise<string> {
@@ -233,6 +300,63 @@ async function postOpenAI(
   return content
 }
 
+// OpenAI の英語 rewrite レスポンスを保存しやすい形に整える。
+function normaliseRewriteItems(items: OpenAIRewriteItem[]): OpenAIRewriteItem[] {
+  return items
+    .map((item) => {
+      const id = readString(item.id)
+      const definition = readString(item.definition)
+      const example = readString(item.example)
+
+      if (!id || !definition) return null
+
+      return {
+        id,
+        definition,
+        example: example || null,
+      }
+    })
+    .filter(
+      (
+        item
+      ): item is {
+        id: string
+        definition: string
+        example: string | null
+      } => item !== null
+    )
+}
+
+// OpenAI の日本語生成レスポンスを保存しやすい形に整える。
+function normaliseTranslationItems(
+  items: OpenAITranslationItem[]
+): OpenAITranslationItem[] {
+  return items
+    .map((item) => {
+      const id = readString(item.id)
+      const definitionJa = readString(item.definitionJa)
+      const exampleJa = readString(item.exampleJa)
+
+      if (!id || !definitionJa) return null
+
+      return {
+        id,
+        definitionJa,
+        exampleJa: exampleJa || null,
+      }
+    })
+    .filter(
+      (
+        item
+      ): item is {
+        id: string
+        definitionJa: string
+        exampleJa: string | null
+      } => item !== null
+    )
+}
+
+// 1 chunk 分の sense を英語 rewrite する。
 async function rewriteChunk(items: RewriteSourceItem[]): Promise<OpenAIRewriteItem[]> {
   const content = await postOpenAI([
     {
@@ -252,197 +376,61 @@ async function rewriteChunk(items: RewriteSourceItem[]): Promise<OpenAIRewriteIt
     throw new Error("OPENAI_REWRITE_INVALID_JSON")
   }
 
-  return parsed.items
+  return normaliseRewriteItems(parsed.items)
 }
 
-function buildLexicalUnitContextKey(
-  context: NormalizedLexicalUnitContext
-): string {
-  return [
-    context.sourceType,
-    context.sourceText ?? "",
-    context.parentDefinition ?? "",
-    context.parentExample ?? "",
-    context.partOfSpeech ?? "",
-  ].join("||")
-}
-
-function normaliseLexicalUnitContexts(
-  contexts: NormalizedLexicalUnitContext[]
-): NormalizedLexicalUnitContext[] {
-  const seen = new Set<string>()
-  const deduped: NormalizedLexicalUnitContext[] = []
-
-  for (const context of contexts) {
-    const key = buildLexicalUnitContextKey(context)
-    if (seen.has(key)) continue
-    seen.add(key)
-    deduped.push(context)
-  }
-
-  return deduped
-}
-
-function buildLexicalUnitPrompt(
-  word: string,
-  unit: NormalizedLexicalUnit
-): string {
-  const contexts = normaliseLexicalUnitContexts(unit.contexts).map((context) => ({
-    sourceType: context.sourceType,
-    sourceText: context.sourceText,
-    parentDefinition: context.parentDefinition,
-    parentExample: context.parentExample,
-    partOfSpeech: context.partOfSpeech,
-  }))
-
-  return [
-    "Create learner-friendly dictionary content for an English phrase.",
-    "Rules:",
-    "- Use British English only.",
-    "- The phrase is derived from dictionary evidence and may be incomplete without context.",
-    "- Use the provided contexts to infer the phrase meaning.",
-    "- Write meanings for the phrase itself, not for the headword alone.",
-    "- Keep meanings concise and faithful.",
-    "- Japanese should be natural and short.",
-    "- Return 1 or 2 meanings only.",
-    "- Return 1 example per meaning.",
-    "- Return JSON only.",
-    "",
-    'Output format: {"meanings":[{"en":"...","ja":"...","examples":[{"sentence":"...","translation":"..."}]}]}',
-    "",
-    "Input:",
-    JSON.stringify({
-      headword: word,
-      phrase: unit.text,
-      contexts,
-    }),
-  ].join("\n")
-}
-
-function normaliseLexicalUnitMeaning(
-  meaning: OpenAILexicalUnitMeaning
-): RewrittenLexicalUnitMeaning | null {
-  const en = readString(meaning.en)
-  const ja = readString(meaning.ja)
-
-  if (!en || !ja) return null
-
-  const examples = Array.isArray(meaning.examples)
-    ? meaning.examples
-        .map((example) => {
-          const sentence = readString(example.sentence)
-          const translation = readString(example.translation)
-
-          if (!sentence || !translation) return null
-
-          return {
-            sentence,
-            translation,
-          }
-        })
-        .filter(
-          (
-            item
-          ): item is {
-            sentence: string
-            translation: string
-          } => item !== null
-        )
-    : []
-
-  return {
-    meaning: {
-      en,
-      ja,
-    },
-    examples,
-  }
-}
-
-async function rewriteSingleLexicalUnit(
-  word: string,
-  unit: NormalizedLexicalUnit
-): Promise<RewrittenLexicalUnit> {
+// 1 chunk 分の英語確定 sense から日本語を生成する。
+async function translateChunk(
+  items: TranslationSourceItem[]
+): Promise<OpenAITranslationItem[]> {
   const content = await postOpenAI([
     {
       role: "system",
       content:
-        "You write learner-friendly British English dictionary content for phrases. Return JSON only.",
+        "You translate learner-friendly English dictionary content into concise natural Japanese. Return JSON only.",
     },
     {
       role: "user",
-      content: buildLexicalUnitPrompt(word, unit),
+      content: buildSenseTranslationPrompt(items),
     },
   ])
 
-  const parsed = safeJsonParse<OpenAILexicalUnitResponse>(content)
+  const parsed = safeJsonParse<OpenAITranslationResponse>(content)
 
-  if (!Array.isArray(parsed.meanings)) {
-    throw new Error(`OPENAI_LEXICAL_UNIT_INVALID_JSON: ${unit.text}`)
+  if (!Array.isArray(parsed.items)) {
+    throw new Error("OPENAI_TRANSLATION_INVALID_JSON")
   }
 
-  const meanings = parsed.meanings
-    .map((meaning) => normaliseLexicalUnitMeaning(meaning))
-    .filter((meaning): meaning is RewrittenLexicalUnitMeaning => meaning !== null)
-
-  if (meanings.length === 0) {
-    throw new Error(`OPENAI_LEXICAL_UNIT_EMPTY_MEANINGS: ${unit.text}`)
-  }
-
-  return {
-    lexicalUnitId: unit.lexicalUnitId,
-    phrase: unit.text,
-    meanings,
-  }
+  return normaliseTranslationItems(parsed.items)
 }
 
-async function rewriteLexicalUnits(
-  word: string,
-  lexicalUnits: NormalizedLexicalUnit[]
-): Promise<RewrittenLexicalUnit[]> {
-  if (lexicalUnits.length === 0) {
-    return []
-  }
-
-  const results: RewrittenLexicalUnit[] = []
-
-  for (const unit of lexicalUnits) {
-    const rewritten = await rewriteSingleLexicalUnit(word, unit)
-    results.push(rewritten)
-  }
-
-  return results
-}
-
+// normalizeDictionary の結果を多言語対応の完成 JSON に変換する。
 export async function rewriteDictionary(
   data: NormalizedDictionary
 ): Promise<RewrittenDictionary> {
   const sourceItems = buildRewriteSources(data)
   const rewrittenMap = new Map<string, OpenAIRewriteItem>()
+  const translatedMap = new Map<string, OpenAITranslationItem>()
 
   for (const group of chunk(sourceItems, CHUNK_SIZE)) {
     const rewrittenItems = await rewriteChunk(group)
 
     for (const item of rewrittenItems) {
       if (!item.id) continue
-
-      const definition = readString(item.definition)
-      if (!definition) continue
-
-      const example = readString(item.example)
-
-      rewrittenMap.set(item.id, {
-        id: item.id,
-        definition,
-        example: example || null,
-      })
+      rewrittenMap.set(item.id, item)
     }
   }
 
-  const rewrittenLexicalUnits = await rewriteLexicalUnits(
-    data.word,
-    data.lexicalUnits
-  )
+  const translationSources = buildTranslationSources(data, rewrittenMap)
+
+  for (const group of chunk(translationSources, CHUNK_SIZE)) {
+    const translatedItems = await translateChunk(group)
+
+    for (const item of translatedItems) {
+      if (!item.id) continue
+      translatedMap.set(item.id, item)
+    }
+  }
 
   return {
     schemaVersion: SCHEMA_VERSION,
@@ -455,20 +443,31 @@ export async function rewriteDictionary(
       shownSenseCount: group.shownSenseCount,
       hasMoreSenses: group.hasMoreSenses,
       senses: group.senses.map((sense) => {
-        const rewritten = rewrittenMap.get(
-          `${group.partOfSpeech}-${sense.senseNumber}`
-        )
+        const rewritten = rewrittenMap.get(sense.senseId)
+        const translated = translatedMap.get(sense.senseId)
+
+        const definitionEn = readString(rewritten?.definition) || sense.definition
+        const exampleEn = readString(rewritten?.example) || sense.example || null
 
         return {
           senseId: sense.senseId,
           senseNumber: sense.senseNumber,
-          definition: rewritten?.definition ?? sense.definition,
-          example: rewritten?.example ?? sense.example ?? null,
+          definition: {
+            en: definitionEn,
+            translations: {
+              ja: readString(translated?.definitionJa),
+            },
+          },
+          example: {
+            en: exampleEn,
+            translations: {
+              ja: translated?.exampleJa ?? null,
+            },
+          },
           patterns: sense.patterns,
         }
       }),
     })),
-    lexicalUnits: rewrittenLexicalUnits,
     derivatives: data.derivatives,
     etymology: data.etymology,
     etymologyData: data.etymologyData,
