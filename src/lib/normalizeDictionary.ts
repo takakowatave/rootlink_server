@@ -8,25 +8,25 @@
  * - Oxford raw を安全に読む
  * - ipa / etymology を抽出する
  * - senseGroups を UI 用に整形する
- * - sense ごとの patterns を抽出する
  * - inflections / derivatives を正規化する
  * - etymologyData を buildEtymologyData で生成する
  *
  * 注意
  * - lexicalUnits の抽出はこのファイルでは行わない
  * - lexicalUnits は外側で生成して input から受け取る
+ * - 語源パーツの primary source は Supabase(etymology_parts / etymology_part_glosses)
  */
 
-import { buildEtymologyData, type AiJsonGenerator } from "./buildEtymologyData.js"
-import type { EtymologyData } from "../types/etymology.js"
+import { buildEtymologyData } from "./buildEtymologyData.js"
+import type { EtymologyData, EtymologyPartType } from "../types/etymology.js"
 
 export type NormalizedSense = {
-  // sense をピン留め・クイズ出題するための安定ID
   senseId: string
   senseNumber: string
   definition: string
-  example: string | null
-  patterns: string[]
+  example?: string
+  grammarTags: string[]
+  registerCodes: string[]
 }
 
 export type NormalizedSenseGroup = {
@@ -62,13 +62,31 @@ export type NormalizedDictionary = {
   etymologyData: EtymologyData | null
 }
 
+export type SupabaseEtymologyPartRow = {
+  part_key: string
+  type: EtymologyPartType
+  value: string
+  sort_order: number | null
+  is_active: boolean | null
+}
+
+export type SupabaseEtymologyPartGlossRow = {
+  id: number
+  part_key: string
+  locale: string
+  gloss: string
+  priority: number | null
+  sort_order: number | null
+}
+
 export type NormalizeDictionaryInput = {
   word: string
   entries: unknown
   inflections: string[]
   derivatives: string[]
   lexicalUnits: NormalizedLexicalUnit[]
-  aiGenerateJson?: AiJsonGenerator
+  partsRows: SupabaseEtymologyPartRow[]
+  glossRows: SupabaseEtymologyPartGlossRow[]
 }
 
 /**
@@ -516,9 +534,9 @@ function extractPrimaryExample(sense: OxfordSense): string | null {
 }
 
 /**
- * patterns ラベル表示用の軽い正規化。
+ * ラベル表示用の軽い正規化。
  */
-function normalizePatternsLabel(text: string): string {
+function normalizeLabel(text: string): string {
   return text.replace(/"/g, "").replace(/\s+/g, " ").trim()
 }
 
@@ -536,52 +554,97 @@ function flattenSenses(lexicalEntry: OxfordLexicalEntry): OxfordSense[] {
  */
 function normalizePartOfSpeech(lexicalEntry: OxfordLexicalEntry): string {
   const value =
-    lexicalEntry.lexicalCategory?.text ??
     lexicalEntry.lexicalCategory?.id ??
+    lexicalEntry.lexicalCategory?.text ??
     lexicalEntry.category ??
     lexicalEntry.partOfSpeech ??
     ""
 
-  return value.trim()
+  const normalized = value.trim().toLowerCase()
+
+  if (normalized === "verb") return "verb"
+  if (normalized === "adjective") return "adjective"
+  if (normalized === "noun") return "noun"
+  if (normalized === "adverb") return "adverb"
+  if (normalized === "preposition") return "preposition"
+
+  return normalized
 }
 
-/**
- * sense ごとの patterns ラベルを作る。
- *
- * 方針
- * - sense ラベルには補助情報だけ残す
- * - lexicalUnit として見せたい constructions はここでは混ぜない
- *
- * 残すもの
- * - registers
- * - domains
- * - notes
- */
-function extractPatternsLabels(sense: OxfordSense, word: string): string[] {
+function toRegisterCode(text: string): string | null {
+  const normalized = text.trim().toLowerCase()
+
+  if (normalized === "informal") return "informal"
+  if (normalized === "dated") return "dated"
+  if (normalized === "offensive") return "offensive"
+  if (normalized === "derogatory") return "derogatory"
+  if (normalized === "vulgar slang") return "vulgar_slang"
+
+  return null
+}
+
+const ALLOWED_GRAMMAR_TAGS = new Set([
+  "mass noun",
+  "count noun",
+  "usually as modifier",
+  "predicative",
+  "attributive",
+  "with no object",
+  "with object",
+  "with adverbial",
+  "with infinitive",
+  "with clause",
+  "in singular",
+  "in plural",
+  "usually in negative",
+  "usually with negative",
+])
+
+function normalizeGrammarTag(text: string): string {
+  return normalizeLabel(text).toLowerCase()
+}
+
+function hasVisibleExample(example: string | null): example is string {
+  return typeof example === "string" && example.trim().length > 0
+}
+
+function extractSenseLabels(
+  sense: OxfordSense,
+  word: string
+): { grammarTags: string[]; registerCodes: string[] } {
   const lowerWord = word.trim().toLowerCase()
 
-  const registers = (sense.registers ?? [])
-    .map((item) => normalizePatternsLabel(getTextValueText(item)))
+  const rawRegisters = (sense.registers ?? [])
+    .map((item) => normalizeLabel(getTextValueText(item)))
     .filter((value) => value.length > 0)
 
-  const domains = (sense.domains ?? [])
-    .map((item) => normalizePatternsLabel(getTextValueText(item)))
+  const rawNotes = (sense.notes ?? [])
+    .map((note) => normalizeLabel(note.text ?? ""))
     .filter((value) => value.length > 0)
 
-  const noteLabels = (sense.notes ?? [])
-    .map((note) => normalizePatternsLabel(note.text ?? ""))
-    .filter((value) => value.length > 0)
+  const registerCodes = uniqueStrings(
+    rawRegisters
+      .map((value) => toRegisterCode(value))
+      .filter((value): value is string => value !== null)
+  )
 
-  return uniqueStrings([
-    ...registers,
-    ...domains,
-    ...noteLabels,
-  ]).filter((value) => value.toLowerCase() !== lowerWord)
+  const grammarTags = uniqueStrings(rawNotes).filter((value) => {
+    const normalized = normalizeGrammarTag(value)
+
+    if (normalized === lowerWord) return false
+    if (toRegisterCode(normalized) !== null) return false
+
+    return ALLOWED_GRAMMAR_TAGS.has(normalized)
+  })
+
+  return {
+    grammarTags,
+    registerCodes,
+  }
 }
 
 /**
  * Oxford raw を senseGroups に整形する。
- * ここで definition / example / patterns を sense 単位にまとめる。
  */
 function extractSenseGroups(
   lexicalEntries: OxfordLexicalEntry[],
@@ -589,7 +652,12 @@ function extractSenseGroups(
 ): NormalizedSenseGroup[] {
   const posMap = new Map<
     string,
-    Array<{ definition: string; example: string; patterns: string[] }>
+    Array<{
+      definition: string
+      example: string
+      grammarTags: string[]
+      registerCodes: string[]
+    }>
   >()
 
   for (const lexicalEntry of lexicalEntries) {
@@ -605,37 +673,41 @@ function extractSenseGroups(
     for (const sense of flattenSenses(lexicalEntry)) {
       const definition = extractPrimaryDefinition(sense)
       const example = extractPrimaryExample(sense)
-      const patterns = extractPatternsLabels(sense, word)
+      const { grammarTags, registerCodes } = extractSenseLabels(sense, word)
 
-      // 例文がない sense は UI に出さない
-      if (!example) continue
+      if (!definition) continue
+      if (!hasVisibleExample(example)) continue
 
       bucket.push({
-        definition: definition ?? "",
+        definition,
         example,
-        patterns,
+        grammarTags,
+        registerCodes,
       })
     }
   }
 
-  return [...posMap.entries()].map(([partOfSpeech, rawSenses]) => {
-    const totalSenseCount = rawSenses.length
+  return [...posMap.entries()]
+    .map(([partOfSpeech, rawSenses]) => {
+      const totalSenseCount = rawSenses.length
+      const shownSenses = rawSenses.slice(0, 3)
 
-    return {
-      partOfSpeech,
-      totalSenseCount,
-      shownSenseCount: totalSenseCount,
-      hasMoreSenses: false,
-      senses: rawSenses.map((sense, index) => ({
-        // headword + pos + index ベースの安定ID
-        senseId: `${word.trim().toLowerCase()}__${partOfSpeech.trim().toLowerCase()}__${index + 1}`,
-        senseNumber: String(index + 1),
-        definition: sense.definition,
-        example: sense.example,
-        patterns: sense.patterns,
-      })),
-    }
-  })
+      return {
+        partOfSpeech,
+        totalSenseCount,
+        shownSenseCount: shownSenses.length,
+        hasMoreSenses: totalSenseCount > shownSenses.length,
+        senses: shownSenses.map((sense, index) => ({
+          senseId: `${word.trim().toLowerCase()}__${partOfSpeech.trim().toLowerCase()}__${index + 1}`,
+          senseNumber: String(index + 1),
+          definition: sense.definition,
+          example: sense.example,
+          grammarTags: sense.grammarTags,
+          registerCodes: sense.registerCodes,
+        })),
+      }
+    })
+    .filter((group) => group.senses.length > 0)
 }
 
 /**
@@ -750,10 +822,6 @@ function normalizeExternalLexicalUnits(
 /**
  * normalizeDictionary の本体。
  * Oxford raw + 補助データを RootLink 用の NormalizedDictionary にまとめる。
- *
- * 注意
- * - buildEtymologyData を await するため async
- * - lexicalUnits は input から受け取る
  */
 export async function normalizeDictionary(
   input: NormalizeDictionaryInput
@@ -764,25 +832,31 @@ export async function normalizeDictionary(
     inflections,
     derivatives,
     lexicalUnits,
-    aiGenerateJson,
+    partsRows,
+    glossRows,
   } = input
 
   const lexicalEntries = getLexicalEntries(entries, word)
   const normalizedInflections = uniqueStrings(inflections)
   const normalizedDerivatives = uniqueStrings(derivatives)
   const normalizedLexicalUnits = normalizeExternalLexicalUnits(lexicalUnits)
-// Oxford から語源文を取る
-const extractedEtymology = extractEtymology(lexicalEntries)
 
-// Oxford に語源文がなくても memory hook 生成を止めない
-const etymology = extractedEtymology || `from ${word}`
+  // Oxford から語源文を取る
+  const extractedEtymology = extractEtymology(lexicalEntries)
 
-// etymologyData を常に生成する（AIは使わない）
-const etymologyData = await buildEtymologyData({
-  headword: word,
-  rawEtymology: etymology,
-  wordFamily: normalizedDerivatives,
-})
+  // Oxford に語源文がなくても memory hook 生成を止めない
+  const etymology = extractedEtymology || `from ${word}`
+
+  // relatedWords 用に headword + derivatives を wordFamily として渡す
+  const wordFamily = uniqueStrings([word, ...normalizedDerivatives])
+
+  const etymologyData = await buildEtymologyData({
+    headword: word,
+    rawEtymology: etymology,
+    wordFamily,
+    partsRows,
+    glossRows,
+  })
 
   return {
     word,

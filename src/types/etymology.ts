@@ -4,24 +4,16 @@ export type EtymologyPartType = "prefix" | "root" | "suffix" | "unknown"
 
 export type OriginLanguage = {
   key: string
-  labelEn: string
-  labelJa: string
 }
 
 export type EtymologyPart = {
-  // パーツ文字列そのもの
   text: string
-  // prefix / root / suffix / unknown
   partType: EtymologyPartType
-  // 英英の短い意味
   meaning: string | null
-  // 日英トグル用の短い日本語意味
-  meaningJa?: string | null
-  // 親族語・関連語
   relatedWords: string[]
-  // 表示順
   order: number
 }
+
 
 export type PartsEtymologyStructure = {
   type: "parts"

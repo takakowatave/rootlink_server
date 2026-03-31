@@ -177,6 +177,19 @@ async function fetchInflections(word: string): Promise<string[]> {
   return uniqueStrings(forms)
 }
 
+/** Oxford entries の results[0].id から実headwordを読む。 */
+function extractHeadword(entries: unknown): string | null {
+  if (!isRecord(entries)) return null
+
+  const results = Array.isArray(entries.results) ? entries.results : []
+  const first = results[0]
+
+  if (!isRecord(first)) return null
+
+  const id = first.id
+  return typeof id === "string" ? id.trim().toLowerCase() : null
+}
+
 /* =========================
    Datamuse suggestion
 ========================= */
@@ -329,6 +342,23 @@ function buildLookupCandidates(input: string): string[] {
 
 /** Oxford から整形に必要な材料を集める。 */
 async function buildNormalizedDictionary(candidate: string, entries: unknown) {
+  const supabase = getSupabase()
+
+  // 語源パーツ取得
+  const { data: partsRowsRaw } = await supabase
+    .from("etymology_parts")
+    .select("*")
+    .eq("is_active", true)
+    .order("sort_order")
+
+  const { data: glossRowsRaw } = await supabase
+    .from("etymology_part_glosses")
+    .select("*")
+    .order("sort_order")
+
+  const partsRows = Array.isArray(partsRowsRaw) ? partsRowsRaw : []
+  const glossRows = Array.isArray(glossRowsRaw) ? glossRowsRaw : []
+
   const [inflections, derivatives] = await Promise.all([
     fetchInflections(candidate),
     generateDerivatives(candidate).catch((error: unknown) => {
@@ -342,7 +372,9 @@ async function buildNormalizedDictionary(candidate: string, entries: unknown) {
     entries,
     inflections,
     derivatives: uniqueStrings(derivatives),
-    lexicalUnits: [], // MVP では lexical は外す。型だけ残して空配列を渡す
+    lexicalUnits: [],
+    partsRows,
+    glossRows,
   })
 }
 
@@ -366,19 +398,32 @@ async function resolveFromCandidates(
       continue
     }
 
-    console.log("NORMALIZE START:", candidate)
-    const normalized = await buildNormalizedDictionary(candidate, entries)
-    console.log("NORMALIZE DONE:", candidate)
+    // Oxford が返した実headwordを最優先で使う
+    const headword = extractHeadword(entries) ?? candidate
+    console.log("OXFORD HEADWORD:", { candidate, headword })
 
-    console.log("REWRITE START:", candidate)
+    // もし candidate ではなく headword 側の cache が既にあるならそれを返す
+    if (headword !== candidate) {
+      const canonicalCached = await getCachedDictionary(headword)
+      if (canonicalCached) {
+        console.log("DICTIONARY CACHE HIT BY HEADWORD:", headword)
+        return { resolved: headword, dictionary: canonicalCached }
+      }
+    }
+
+    console.log("NORMALIZE START:", headword)
+    const normalized = await buildNormalizedDictionary(headword, entries)
+    console.log("NORMALIZE DONE:", headword)
+
+    console.log("REWRITE START:", headword)
     const dictionary = await rewriteDictionary(normalized)
-    console.log("REWRITE DONE:", candidate)
+    console.log("REWRITE DONE:", headword)
 
-    console.log("CACHE SAVE START:", candidate)
-    await saveDictionary(candidate, dictionary)
-    console.log("DICTIONARY CACHE SAVED:", candidate)
+    console.log("CACHE SAVE START:", headword)
+    await saveDictionary(headword, dictionary)
+    console.log("DICTIONARY CACHE SAVED:", headword)
 
-    return { resolved: candidate, dictionary }
+    return { resolved: headword, dictionary }
   }
 
   return null
@@ -407,7 +452,6 @@ async function resolveQueryInternal(raw: string): Promise<ResolveResult> {
     console.log("RESOLVE QUERY START:", raw)
 
     const input = raw.trim().toLowerCase()
-    const suggestCache: SuggestCache = new Map()
 
     const normalized = normalizeWord(input)
     const candidates = buildLookupCandidates(normalized)
@@ -424,36 +468,7 @@ async function resolveQueryInternal(raw: string): Promise<ResolveResult> {
       }
     }
 
-    const suggestionSource = normalized.includes(" ")
-      ? normalized.split(/\s+/)[0]
-      : normalized
-
-    const suggestionBase = getLemma(suggestionSource)
-    console.log("SUGGESTION BASE:", suggestionBase)
-
-    const suggestion = await getSuggestion(suggestionBase, suggestCache)
-    if (!suggestion) {
-      console.log("NO SUGGESTION:", suggestionBase)
-      return { ok: false, reason: "NO_RESULT" }
-    }
-
-    console.log("SUGGESTION LOOKUP START:", suggestion)
-
-    const suggested = await resolveFromCandidates([suggestion])
-    if (!suggested) {
-      console.log("SUGGESTION LOOKUP FAILED:", suggestion)
-      return { ok: false, reason: "NO_RESULT" }
-    }
-
-    console.log("SUGGESTION LOOKUP DONE:", suggestion)
-
-    return {
-      ok: true,
-      resolved: suggested.resolved,
-      changed: suggested.resolved !== input,
-      redirectTo: `/word/${suggested.resolved}`,
-      dictionary: suggested.dictionary,
-    }
+    return { ok: false, reason: "NO_RESULT" }
   } catch (error) {
     if (error instanceof OxfordUsageLimitError) {
       console.error("OXFORD USAGE LIMIT EXCEEDED")
