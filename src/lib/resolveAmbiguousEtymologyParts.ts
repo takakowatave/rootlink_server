@@ -3,7 +3,7 @@
  *
  * 役割:
  * - すでに抽出済みの語源パーツ候補に対して、
- *   複数 gloss 候補を持つ part だけを AI で判定する
+ *   各 part を AI で判定する
  * - meaning / meaningJa を自由生成しない
  * - CSV / Supabase を primary source とし、AI は候補選択だけを行う
  * - 語源文と合う候補がない part は「表示しない」を選べる
@@ -14,11 +14,10 @@
  * - glossCandidates は primary source 由来の候補配列
  *
  * 内部の流れ:
- * 1. 候補1件の part はそのまま採用
- * 2. 候補複数の part だけ AI に渡す
- * 3. AI は「候補 index を選ぶ」または「非表示」を返す
- * 4. 非表示判定 / 低信頼 / AI失敗の part は落とす
- * 5. 最終的に表示してよい part だけ返す
+ * 1. 候補数に関係なく、すべての part を AI に渡す
+ * 2. AI は「候補 index を選ぶ」または「非表示」を返す
+ * 3. 非表示判定 / 低信頼 / AI失敗の part は落とす
+ * 4. 最終的に表示してよい part だけ返す
  */
 
 const OPENAI_API_URL =
@@ -338,35 +337,15 @@ function toResolvedPart(
 export async function resolveAmbiguousEtymologyParts(
   input: ResolveAmbiguousEtymologyPartsInput
 ): Promise<ResolvedEtymologyPart[]> {
-  const alwaysVisibleParts: ResolvedEtymologyPart[] = []
-  const ambiguousParts: AmbiguousEtymologyPart[] = []
+  // 候補数に関係なく、すべての part を AI 判定に回す。
+  const partsToResolve = [...input.parts]
 
-  // 1件しか候補がない part はそのまま採用。
-  // 複数候補の part だけ AI 判定に回す。
-  for (const part of input.parts) {
-    if (part.glossCandidates.length <= 1) {
-      const first = part.glossCandidates[0]
-
-      alwaysVisibleParts.push({
-        text: part.text,
-        partType: part.partType,
-        meaning: first?.meaning ?? null,
-        meaningJa: first?.meaningJa ?? null,
-        relatedWords: part.relatedWords,
-        order: part.order,
-      })
-      continue
-    }
-
-    ambiguousParts.push(part)
-  }
-
-  if (ambiguousParts.length === 0) {
-    return [...alwaysVisibleParts].sort((a, b) => a.order - b.order)
+  if (partsToResolve.length === 0) {
+    return []
   }
 
   const selectionMap = new Map<number, SelectedGlossItem>()
-  const batches = chunk(ambiguousParts, 8)
+  const batches = chunk(partsToResolve, 8)
 
   // AI は part ごとに
   // - 候補を選ぶ
@@ -388,11 +367,9 @@ export async function resolveAmbiguousEtymologyParts(
     }
   }
 
-  const resolvedAmbiguousParts = ambiguousParts
+  const resolvedParts = partsToResolve
     .map((part) => toResolvedPart(part, selectionMap.get(part.order)))
     .filter((part): part is ResolvedEtymologyPart => part !== null)
 
-  return [...alwaysVisibleParts, ...resolvedAmbiguousParts].sort(
-    (a, b) => a.order - b.order
-  )
+  return resolvedParts.sort((a, b) => a.order - b.order)
 }
