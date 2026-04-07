@@ -754,9 +754,17 @@ export async function buildEtymologyData(
   const catalogValues = new Set(resolvedCatalogParts.map((p) => p.value.toLowerCase()))
 
   // カタログに含まれていないパーツのみ追加
+  // ハイフンを除去して正規化し重複を防ぐ（例: "ive" と "-ive" を同一視）
+  const normalizePartValue = (v: string) => v.replace(/^-+|-+$/g, "").toLowerCase()
+  const catalogValuesNorm = new Set(
+    resolvedCatalogParts.map((p) => normalizePartValue(p.value))
+  )
+
   const additionalFromAI = toResolvedFromExtracted(
     aiExtracted.filter(
-      (p) => !catalogPartKeys.has(p.part_key) && !catalogValues.has(p.value.toLowerCase())
+      (p) =>
+        !catalogPartKeys.has(p.part_key) &&
+        !catalogValuesNorm.has(normalizePartValue(p.value))
     )
   )
 
