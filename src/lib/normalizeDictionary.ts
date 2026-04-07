@@ -62,23 +62,6 @@ export type NormalizedDictionary = {
   etymologyData: EtymologyData | null
 }
 
-export type SupabaseEtymologyPartRow = {
-  part_key: string
-  type: EtymologyPartType
-  value: string
-  sort_order: number | null
-  is_active: boolean | null
-}
-
-export type SupabaseEtymologyPartGlossRow = {
-  id: number
-  part_key: string
-  locale: string
-  gloss: string
-  priority: number | null
-  sort_order: number | null
-}
-
 type NewPartToUpsert = {
   part_key: string
   value: string
@@ -93,8 +76,6 @@ export type NormalizeDictionaryInput = {
   inflections: string[]
   derivatives: string[]
   lexicalUnits: NormalizedLexicalUnit[]
-  partsRows: SupabaseEtymologyPartRow[]
-  glossRows: SupabaseEtymologyPartGlossRow[]
   upsertNewParts?: (parts: NewPartToUpsert[]) => Promise<void>
 }
 
@@ -891,8 +872,6 @@ export async function normalizeDictionary(
     inflections,
     derivatives,
     lexicalUnits,
-    partsRows,
-    glossRows,
   } = input
 
   const lexicalEntries = getLexicalEntries(entries, word)
@@ -913,8 +892,6 @@ export async function normalizeDictionary(
     headword: word,
     rawEtymology: etymology,
     wordFamily,
-    partsRows,
-    glossRows,
     upsertNewParts: input.upsertNewParts,
   })
 

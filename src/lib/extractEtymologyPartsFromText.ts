@@ -1,11 +1,8 @@
 /**
  * extractEtymologyPartsFromText
  *
- * 語源文（rawEtymology）から AI がパーツを直接抽出する。
- *
- * 既存カタログ（etymology_parts）にあるパーツは既存の part_key と gloss を使用。
- * カタログにない新パーツは意味を AI が生成し、isNew=true を返す。
- * 呼び出し元が新パーツを Supabase に upsert する責務を持つ。
+ * rawEtymology から AI がパーツを直接抽出する。
+ * DBへの読み書きはしない。呼び出し元が upsert する責務を持つ。
  */
 
 import type { EtymologyPartType } from "../types/etymology.js"
@@ -22,21 +19,6 @@ export type ExtractedEtymologyPart = {
   type: EtymologyPartType
   meaning: string
   meaningJa: string
-  isNew: boolean
-}
-
-type InputPartsRow = {
-  part_key: string
-  type: EtymologyPartType
-  value: string
-  is_active: boolean | null
-}
-
-type InputGlossRow = {
-  part_key: string
-  locale: string
-  gloss: string
-  priority: number | null
 }
 
 type AiPart = {
@@ -47,7 +29,7 @@ type AiPart = {
 }
 
 function normalizeValue(value: string): string {
-  return value.trim().toLowerCase().replace(/-+$/, "")
+  return value.trim().replace(/^-+|-+$/g, "").toLowerCase()
 }
 
 function generatePartKey(type: string, value: string): string {
@@ -95,29 +77,10 @@ async function callOpenAI(prompt: string): Promise<string> {
 export async function extractEtymologyPartsFromText(input: {
   headword: string
   rawEtymology: string
-  partsRows: InputPartsRow[]
-  glossRows: InputGlossRow[]
 }): Promise<ExtractedEtymologyPart[]> {
-  const { headword, rawEtymology, partsRows, glossRows } = input
+  const { headword, rawEtymology } = input
 
   if (!rawEtymology.trim()) return []
-
-  // 既存カタログのインデックス: "value::type" -> part_key
-  const existingIndex = new Map<string, string>()
-  for (const row of partsRows) {
-    if (row.is_active === false) continue
-    const key = `${normalizeValue(row.value)}::${row.type}`
-    existingIndex.set(key, row.part_key)
-  }
-
-  // gloss lookup: part_key -> { en, ja }
-  const glossByKey = new Map<string, { en: string; ja: string }>()
-  for (const row of glossRows) {
-    const entry = glossByKey.get(row.part_key) ?? { en: "", ja: "" }
-    if (row.locale === "en" && !entry.en) entry.en = row.gloss
-    if (row.locale === "ja" && !entry.ja) entry.ja = row.gloss
-    glossByKey.set(row.part_key, entry)
-  }
 
   const prompt = [
     "You are an expert English etymologist. Extract meaningful morpheme parts from the etymology of the following word.",
@@ -127,12 +90,12 @@ export async function extractEtymologyPartsFromText(input: {
     "",
     "Instructions:",
     "- Identify prefixes, roots, and suffixes that appear in the headword AND are supported by the etymology text.",
-    "- For each part provide: value (the morpheme as it appears in the headword), type (prefix/root/suffix), meaningEn (1-5 words), meaningJa (Japanese, 1-5 words).",
+    "- For each part provide: value (the morpheme as it appears in the headword, no hyphens), type (prefix/root/suffix), meaningEn (1-5 words), meaningJa (Japanese, 1-5 words).",
     "- IMPORTANT: For meaningEn, give the morpheme's original base/lemma meaning — NOT the inflected or contextual form from the etymology sentence.",
-    "  e.g. 'competit-' in 'competitive' → meaningEn: 'to seek, aim' (not 'striven for')",
+    "  e.g. 'competit-' in 'competitive' → split into 'com' (together) + 'petit' (to seek, aim for)",
     "  e.g. 'pon' in 'component' → meaningEn: 'to place' (not 'placing')",
-    "- If a root mentioned in the etymology is itself composed of smaller parts visible in the headword (e.g. 'competere' = 'com' + 'petere'), break it into those smaller parts.",
-    "- Use clean morpheme values without trailing hyphens (e.g. 'com' not 'com-', 'ive' not '-ive').",
+    "- If a root in the etymology is itself a compound visible in the headword (e.g. 'competere' = 'com' + 'petere'), break it into those smaller parts.",
+    "- Use clean morpheme values without hyphens (e.g. 'com' not 'com-', 'ive' not '-ive').",
     "- Only extract parts genuinely supported by the etymology text. Do not invent parts.",
     "",
     "Good example for 'competitive':",
@@ -155,45 +118,26 @@ export async function extractEtymologyPartsFromText(input: {
   }
 
   const VALID_TYPES = new Set<string>(["prefix", "root", "suffix", "unknown"])
-
+  const seen = new Set<string>()
   const results: ExtractedEtymologyPart[] = []
-  const seenKeys = new Set<string>()
 
   for (const p of aiParts) {
     if (!p.value || !VALID_TYPES.has(p.type) || !p.meaningEn) continue
 
-    const valueLower = normalizeValue(p.value)
+    const value = normalizeValue(p.value)
     const type = p.type as EtymologyPartType
-    const indexKey = `${valueLower}::${type}`
+    const dedupeKey = `${value}::${type}`
 
-    // 重複除去
-    if (seenKeys.has(indexKey)) continue
-    seenKeys.add(indexKey)
+    if (seen.has(dedupeKey)) continue
+    seen.add(dedupeKey)
 
-    const existingKey = existingIndex.get(indexKey)
-
-    if (existingKey) {
-      // 既存パーツ: DB の gloss を優先
-      const glosses = glossByKey.get(existingKey) ?? { en: "", ja: "" }
-      results.push({
-        part_key: existingKey,
-        value: valueLower,
-        type,
-        meaning: glosses.en || p.meaningEn,
-        meaningJa: glosses.ja || p.meaningJa,
-        isNew: false,
-      })
-    } else {
-      // 新パーツ: AI 生成の意味を使う
-      results.push({
-        part_key: generatePartKey(type, valueLower),
-        value: valueLower,
-        type,
-        meaning: p.meaningEn,
-        meaningJa: p.meaningJa,
-        isNew: true,
-      })
-    }
+    results.push({
+      part_key: generatePartKey(type, value),
+      value,
+      type,
+      meaning: p.meaningEn,
+      meaningJa: p.meaningJa ?? "",
+    })
   }
 
   return results

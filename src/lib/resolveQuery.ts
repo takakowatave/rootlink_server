@@ -364,21 +364,6 @@ function needsSenseFallback(senseGroups: NormalizedSenseGroup[]): boolean {
 async function buildNormalizedDictionary(candidate: string, entries: unknown) {
   const supabase = getSupabase()
 
-  // 語源パーツ取得
-  const { data: partsRowsRaw } = await supabase
-    .from("etymology_parts")
-    .select("*")
-    .eq("is_active", true)
-    .order("sort_order")
-
-  const { data: glossRowsRaw } = await supabase
-    .from("etymology_part_glosses")
-    .select("*")
-    .order("sort_order")
-
-  const partsRows = Array.isArray(partsRowsRaw) ? partsRowsRaw : []
-  const glossRows = Array.isArray(glossRowsRaw) ? glossRowsRaw : []
-
   const [inflections, derivatives] = await Promise.all([
     fetchInflections(candidate),
     generateDerivatives(candidate).catch((error: unknown) => {
@@ -393,10 +378,9 @@ async function buildNormalizedDictionary(candidate: string, entries: unknown) {
     inflections,
     derivatives: uniqueStrings(derivatives),
     lexicalUnits: [],
-    partsRows,
-    glossRows,
     upsertNewParts: async (newParts) => {
       for (const p of newParts) {
+        // parts: 既存があればスキップ（first write wins）
         await supabase
           .from("etymology_parts")
           .upsert(
@@ -407,9 +391,10 @@ async function buildNormalizedDictionary(candidate: string, entries: unknown) {
               sort_order: 999,
               is_active: true,
             },
-            { onConflict: "part_key" }
+            { onConflict: "part_key", ignoreDuplicates: true }
           )
 
+        // glosses: 既存があればスキップ（first write wins）
         await supabase
           .from("etymology_part_glosses")
           .upsert(
@@ -429,10 +414,10 @@ async function buildNormalizedDictionary(candidate: string, entries: unknown) {
                 sort_order: 1,
               },
             ],
-            { onConflict: "part_key,locale" }
+            { onConflict: "part_key,locale,priority", ignoreDuplicates: true }
           )
 
-        console.log("NEW ETYMOLOGY PART UPSERTED:", p.part_key, p.value, p.type)
+        console.log("ETYMOLOGY PART SAVED:", p.part_key, p.value, p.type)
       }
     },
   })
