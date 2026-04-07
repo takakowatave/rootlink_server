@@ -1,13 +1,14 @@
 import { normalizeWord } from "./normalize.js"
 import { getSupabase } from "../lib/supabase.js"
 import { generateDerivatives } from "../lib/generateDerivatives.js"
-import { normalizeDictionary } from "../lib/normalizeDictionary.js"
+import { normalizeDictionary, type NormalizedSenseGroup } from "../lib/normalizeDictionary.js"
 import { buildEtymologyData } from "./buildEtymologyData.js"
 import {
   rewriteDictionary,
   type RewrittenDictionary,
 } from "../lib/rewriteDictionary.js"
 import { getLemma } from "./lemma.js"
+import { generateSensesAI } from "./generateSensesAI.js"
 
 /**
  * resolveQuery.ts
@@ -340,6 +341,25 @@ function buildLookupCandidates(input: string): string[] {
   return uniqueStrings(values)
 }
 
+/**
+ * Oxford の sense データが不十分かどうか判定する。
+ *
+ * 以下のいずれかに該当する場合に GPT 補完を発動する:
+ * 1. senseGroups が空（turtle のように Oxford が何も返さなかった場合）
+ * 2. 全 sense に registerCodes があり、中立な sense が一つもない
+ *    （goat のように informal/derogatory しか返さなかった場合）
+ */
+function needsSenseFallback(senseGroups: NormalizedSenseGroup[]): boolean {
+  if (senseGroups.length === 0) return true
+
+  const allSenses = senseGroups.flatMap((g) => g.senses)
+  if (allSenses.length === 0) return true
+
+  // registerCodes が空 = 中立な sense（informal/derogatory でない）
+  const hasNeutralSense = allSenses.some((s) => s.registerCodes.length === 0)
+  return !hasNeutralSense
+}
+
 /** Oxford から整形に必要な材料を集める。 */
 async function buildNormalizedDictionary(candidate: string, entries: unknown) {
   const supabase = getSupabase()
@@ -367,7 +387,7 @@ async function buildNormalizedDictionary(candidate: string, entries: unknown) {
     }),
   ])
 
-  return await normalizeDictionary({
+  const normalized = await normalizeDictionary({
     word: candidate,
     entries,
     inflections,
@@ -375,7 +395,63 @@ async function buildNormalizedDictionary(candidate: string, entries: unknown) {
     lexicalUnits: [],
     partsRows,
     glossRows,
+    upsertNewParts: async (newParts) => {
+      for (const p of newParts) {
+        await supabase
+          .from("etymology_parts")
+          .upsert(
+            {
+              part_key: p.part_key,
+              type: p.type,
+              value: p.value,
+              sort_order: 999,
+              is_active: true,
+            },
+            { onConflict: "part_key" }
+          )
+
+        await supabase
+          .from("etymology_part_glosses")
+          .upsert(
+            [
+              {
+                part_key: p.part_key,
+                locale: "en",
+                gloss: p.meaning,
+                priority: 1,
+                sort_order: 1,
+              },
+              {
+                part_key: p.part_key,
+                locale: "ja",
+                gloss: p.meaningJa,
+                priority: 1,
+                sort_order: 1,
+              },
+            ],
+            { onConflict: "part_key,locale" }
+          )
+
+        console.log("NEW ETYMOLOGY PART UPSERTED:", p.part_key, p.value, p.type)
+      }
+    },
   })
+
+  // Oxford データが貧弱な場合は GPT で sense を補完する
+  // 生成した sense を先頭に置き、Oxford の register 付き sense を後ろに続ける
+  if (needsSenseFallback(normalized.senseGroups)) {
+    console.log("SENSE FALLBACK TRIGGERED:", candidate)
+    const generatedGroups = await generateSensesAI({
+      word: candidate,
+      etymologyHint: normalized.etymology,
+    })
+    return {
+      ...normalized,
+      senseGroups: [...generatedGroups, ...normalized.senseGroups],
+    }
+  }
+
+  return normalized
 }
 
 /** 候補を順に調べ、cache hit なら返し、miss なら Oxford -> normalize -> rewrite -> 保存する。 */

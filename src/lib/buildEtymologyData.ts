@@ -45,11 +45,23 @@ import {
   resolveAmbiguousEtymologyParts,
   type AmbiguousEtymologyPart,
 } from "./resolveAmbiguousEtymologyParts.js"
+import {
+  extractEtymologyPartsFromText,
+  type ExtractedEtymologyPart,
+} from "./extractEtymologyPartsFromText.js"
 
 type AiJsonGenerator = <T>(_input: {
   systemPrompt: string
   userPrompt: string
 }) => Promise<T>
+
+type NewPartToUpsert = {
+  part_key: string
+  value: string
+  type: EtymologyPartType
+  meaning: string
+  meaningJa: string
+}
 
 type BuildEtymologyDataInput = {
   headword: string
@@ -64,6 +76,9 @@ type BuildEtymologyDataInput = {
 
   // parts の最終表示可否だけを判定する
   aiGenerateJson?: AiJsonGenerator
+
+  // 新規パーツを DB に保存するコールバック（省略可）
+  upsertNewParts?: (parts: NewPartToUpsert[]) => Promise<void>
 }
 
 type SupabaseEtymologyPartRow = {
@@ -667,12 +682,28 @@ async function judgeMatchedPartsForDisplay(input: {
   }
 }
 
+// AI 抽出パーツを ResolvedCatalogPart に変換する。
+function toResolvedFromExtracted(
+  parts: ExtractedEtymologyPart[]
+): ResolvedCatalogPart[] {
+  return parts.map((p, index) => ({
+    part_key: p.part_key,
+    type: p.type,
+    value: p.value,
+    sort_order: 900 + index, // catalog より後ろに並べる
+    meaning: p.meaning,
+    meaningJa: p.meaningJa || null,
+  }))
+}
+
 // Supabase の語源パーツを中心に EtymologyData を組み立てる。
 // 内部の流れ:
 // 1. DB parts を headword にマッチ
 // 2. 複数 gloss 候補の part は resolver で語源文照合
-// 3. その後、表示してよい part_key だけ AI で絞る
-// 4. 1件も残らなければ origin 構造に落とす
+// 3. 語源文から AI がパーツを直接抽出してマージ（カタログ優先）
+// 4. その後、表示してよい part_key だけ AI で絞る
+// 5. 新規パーツを upsert コールバックに渡す
+// 6. 1件も残らなければ origin 構造に落とす
 export async function buildEtymologyData(
   input: BuildEtymologyDataInput
 ): Promise<EtymologyData | null> {
@@ -686,6 +717,7 @@ export async function buildEtymologyData(
     ? detectOriginLanguage(rawEtymology)
     : null
 
+  // ---- Step 1: カタログマッチング ----
   const matchedParts = matchCatalogParts({
     headword,
     rawEtymology,
@@ -693,7 +725,44 @@ export async function buildEtymologyData(
     glossRows: input.glossRows,
   })
 
-  if (matchedParts.length === 0) {
+  // ---- Step 2: ambiguity 解決 ----
+  const resolvedAmbiguousParts = matchedParts.length > 0
+    ? await resolveAmbiguousEtymologyParts({
+        headword,
+        rawEtymology: rawEtymology || null,
+        parts: toResolverInputParts(matchedParts, wordFamily),
+      })
+    : []
+
+  const resolvedCatalogParts = mergeResolvedParts(matchedParts, resolvedAmbiguousParts)
+
+  // ---- Step 3: 語源文から AI 抽出してマージ ----
+  const aiExtracted = rawEtymology
+    ? await extractEtymologyPartsFromText({
+        headword,
+        rawEtymology,
+        partsRows: input.partsRows,
+        glossRows: input.glossRows,
+      }).catch((err) => {
+        console.error("extractEtymologyPartsFromText failed:", err)
+        return [] as ExtractedEtymologyPart[]
+      })
+    : []
+
+  // カタログで解決済みの part_key セット（重複排除用）
+  const catalogPartKeys = new Set(resolvedCatalogParts.map((p) => p.part_key))
+  const catalogValues = new Set(resolvedCatalogParts.map((p) => p.value.toLowerCase()))
+
+  // カタログに含まれていないパーツのみ追加
+  const additionalFromAI = toResolvedFromExtracted(
+    aiExtracted.filter(
+      (p) => !catalogPartKeys.has(p.part_key) && !catalogValues.has(p.value.toLowerCase())
+    )
+  )
+
+  const mergedParts: ResolvedCatalogPart[] = [...resolvedCatalogParts, ...additionalFromAI]
+
+  if (!shouldUsePartsStructure(mergedParts)) {
     return buildOriginResult({
       originLanguage,
       rawEtymology,
@@ -701,32 +770,36 @@ export async function buildEtymologyData(
     })
   }
 
-  const resolvedAmbiguousParts = await resolveAmbiguousEtymologyParts({
-    headword,
-    rawEtymology: rawEtymology || null,
-    parts: toResolverInputParts(matchedParts, wordFamily),
-  })
-
-  const resolvedParts = mergeResolvedParts(matchedParts, resolvedAmbiguousParts)
-
-  if (!shouldUsePartsStructure(resolvedParts)) {
-    return buildOriginResult({
-      originLanguage,
-      rawEtymology,
-      wordFamily,
-    })
-  }
-
+  // ---- Step 4: 表示フィルタ ----
   const decision = await judgeMatchedPartsForDisplay({
     headword,
     rawEtymology,
-    resolvedParts,
+    resolvedParts: mergedParts,
     aiGenerateJson: input.aiGenerateJson,
   })
 
-  const filteredParts = resolvedParts.filter((part) =>
+  const filteredParts = mergedParts.filter((part) =>
     decision.selectedPartKeys.includes(part.part_key)
   )
+
+  // ---- Step 5: 新規パーツを upsert ----
+  if (input.upsertNewParts) {
+    const newPartsToSave: NewPartToUpsert[] = aiExtracted
+      .filter((p) => p.isNew)
+      .map((p) => ({
+        part_key: p.part_key,
+        value: p.value,
+        type: p.type,
+        meaning: p.meaning,
+        meaningJa: p.meaningJa,
+      }))
+
+    if (newPartsToSave.length > 0) {
+      await input.upsertNewParts(newPartsToSave).catch((err) => {
+        console.error("upsertNewParts failed:", err)
+      })
+    }
+  }
 
   if (filteredParts.length === 0) {
     return buildOriginResult({

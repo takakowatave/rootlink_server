@@ -79,6 +79,14 @@ export type SupabaseEtymologyPartGlossRow = {
   sort_order: number | null
 }
 
+type NewPartToUpsert = {
+  part_key: string
+  value: string
+  type: string
+  meaning: string
+  meaningJa: string
+}
+
 export type NormalizeDictionaryInput = {
   word: string
   entries: unknown
@@ -87,6 +95,7 @@ export type NormalizeDictionaryInput = {
   lexicalUnits: NormalizedLexicalUnit[]
   partsRows: SupabaseEtymologyPartRow[]
   glossRows: SupabaseEtymologyPartGlossRow[]
+  upsertNewParts?: (parts: NewPartToUpsert[]) => Promise<void>
 }
 
 /**
@@ -114,6 +123,7 @@ type OxfordExample = {
 }
 
 type OxfordSense = {
+  id?: string
   definitions?: string[]
   shortDefinitions?: string[]
   examples?: OxfordExample[]
@@ -270,6 +280,7 @@ function readExample(value: unknown): OxfordExample | null {
 function readSense(value: unknown): OxfordSense | null {
   if (!isRecord(value)) return null
 
+  const id = readString(value.id)
   const definitions = readStringArray(value.definitions)
   const shortDefinitions = readStringArray(value.shortDefinitions)
   const examples = readArray(value.examples, readExample)
@@ -291,6 +302,7 @@ function readSense(value: unknown): OxfordSense | null {
   }
 
   return {
+    id: id || undefined,
     definitions: definitions.length > 0 ? definitions : undefined,
     shortDefinitions: shortDefinitions.length > 0 ? shortDefinitions : undefined,
     examples: examples.length > 0 ? examples : undefined,
@@ -541,12 +553,16 @@ function normalizeLabel(text: string): string {
 }
 
 /**
- * base sense + subsense を1本化する。
- * ここでは深掘り再帰せず、現在の1段 flatten を維持する。
+ * base sense + subsense を Oxford の並び順を保ったまま1本化する。
+ * ネストした subsense も再帰で展開する。
  */
 function flattenSenses(lexicalEntry: OxfordLexicalEntry): OxfordSense[] {
+  const flattenSenseTree = (sense: OxfordSense): OxfordSense[] => {
+    return [sense, ...(sense.subsenses ?? []).flatMap(flattenSenseTree)]
+  }
+
   const baseSenses = getEntries(lexicalEntry).flatMap((entry) => getSenses(entry))
-  return baseSenses.flatMap((sense) => [sense, ...(sense.subsenses ?? [])])
+  return baseSenses.flatMap(flattenSenseTree)
 }
 
 /**
@@ -604,8 +620,34 @@ function normalizeGrammarTag(text: string): string {
   return normalizeLabel(text).toLowerCase()
 }
 
-function hasVisibleExample(example: string | null): example is string {
-  return typeof example === "string" && example.trim().length > 0
+/**
+ * example はあれば残す。
+ * 例文がなくても sense 自体は落とさない。
+ */
+function toOptionalExample(example: string | null): string | undefined {
+  if (typeof example !== "string") return undefined
+
+  const normalized = example.trim()
+  return normalized.length > 0 ? normalized : undefined
+}
+
+/**
+ * Oxford sense id があればそれを優先し、
+ * なければ fallback id を生成する。
+ */
+function buildNormalizedSenseId(input: {
+  sense: OxfordSense
+  word: string
+  partOfSpeech: string
+  fallbackOrdinal: number
+}): string {
+  const { sense, word, partOfSpeech, fallbackOrdinal } = input
+
+  if (sense.id && sense.id.trim().length > 0) {
+    return sense.id.trim()
+  }
+
+  return `${word.trim().toLowerCase()}__${partOfSpeech.trim().toLowerCase()}__${fallbackOrdinal}`
 }
 
 function extractSenseLabels(
@@ -645,6 +687,11 @@ function extractSenseLabels(
 
 /**
  * Oxford raw を senseGroups に整形する。
+ *
+ * 役割:
+ * - definition がある sense は例文の有無に関係なく残す
+ * - Oxford の並び順をそのまま維持する
+ * - senseId は Oxford id を優先して保持する
  */
 function extractSenseGroups(
   lexicalEntries: OxfordLexicalEntry[],
@@ -653,8 +700,10 @@ function extractSenseGroups(
   const posMap = new Map<
     string,
     Array<{
+      senseId: string
+      senseNumber: string
       definition: string
-      example: string
+      example?: string
       grammarTags: string[]
       registerCodes: string[]
     }>
@@ -670,15 +719,25 @@ function extractSenseGroups(
       posMap.set(partOfSpeech, bucket)
     }
 
-    for (const sense of flattenSenses(lexicalEntry)) {
+    const flattenedSenses = flattenSenses(lexicalEntry)
+
+    for (const sense of flattenedSenses) {
       const definition = extractPrimaryDefinition(sense)
-      const example = extractPrimaryExample(sense)
+      const example = toOptionalExample(extractPrimaryExample(sense))
       const { grammarTags, registerCodes } = extractSenseLabels(sense, word)
 
       if (!definition) continue
-      if (!hasVisibleExample(example)) continue
+
+      const fallbackOrdinal = bucket.length + 1
 
       bucket.push({
+        senseId: buildNormalizedSenseId({
+          sense,
+          word,
+          partOfSpeech,
+          fallbackOrdinal,
+        }),
+        senseNumber: String(fallbackOrdinal),
         definition,
         example,
         grammarTags,
@@ -697,9 +756,9 @@ function extractSenseGroups(
         totalSenseCount,
         shownSenseCount: shownSenses.length,
         hasMoreSenses: totalSenseCount > shownSenses.length,
-        senses: shownSenses.map((sense, index) => ({
-          senseId: `${word.trim().toLowerCase()}__${partOfSpeech.trim().toLowerCase()}__${index + 1}`,
-          senseNumber: String(index + 1),
+        senses: shownSenses.map((sense) => ({
+          senseId: sense.senseId,
+          senseNumber: sense.senseNumber,
           definition: sense.definition,
           example: sense.example,
           grammarTags: sense.grammarTags,
@@ -856,6 +915,7 @@ export async function normalizeDictionary(
     wordFamily,
     partsRows,
     glossRows,
+    upsertNewParts: input.upsertNewParts,
   })
 
   return {
