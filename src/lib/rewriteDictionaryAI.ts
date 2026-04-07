@@ -44,6 +44,7 @@ type RewriteSourceItem = {
 type TranslationSourceItem = {
   id: string
   partOfSpeech: string
+  headword: string
   definitionEn: string
   exampleEn: string | null
 }
@@ -157,6 +158,7 @@ function buildTranslationSources(
       items.push({
         id: sense.senseId,
         partOfSpeech: group.partOfSpeech,
+        headword: data.word,
         definitionEn,
         exampleEn: sense.example || null,
       })
@@ -203,13 +205,14 @@ function buildSenseTranslationPrompt(items: TranslationSourceItem[]): string {
     "Write concise, dictionary-style Japanese.",
     "",
     "Rules for definitionJa:",
-    "- Preserve the part of speech.",
-    "- verb -> use a Japanese verb gloss.",
+    "- Use the partOfSpeech field only to guide the style of the gloss — do NOT include part of speech labels in the output.",
+    "- Do NOT append part of speech labels like （動詞）、（名詞）、（形容詞） to the definitionJa.",
+    "- verb -> use a concise Japanese verb ending in 〜する or 〜だ.",
     "- noun -> use a Japanese noun gloss.",
-    "- adjective -> use a Japanese adjective-style gloss.",
+    "- adjective -> use a natural Japanese adjective ending in 〜な or 〜的な or 〜の. NEVER paraphrase with 〜に関係する or 〜に関する.",
     "- adverb -> use a Japanese adverb-style gloss.",
     "- Keep it short and dictionary-like.",
-    "- Do NOT write explanatory phrases.",
+    "- Do NOT write explanatory phrases like 「〜に関係する」「〜に関する」「〜に関連する」.",
     "- Do NOT use endings like:",
     '  - 「〜すること」',
     '  - 「〜できること」',
@@ -217,6 +220,8 @@ function buildSenseTranslationPrompt(items: TranslationSourceItem[]): string {
     '  - 「〜であること」',
     "- unless the source sense itself is explicitly an abstract noun sense.",
     "- Prefer the most standard learner-dictionary Japanese gloss.",
+    "  e.g. 'competitive' adjective -> 競争的な  (NOT 他より優れようとすることに関係する)",
+    "  e.g. 'transparent' adjective -> 透明な  (NOT 光を通すことに関係する)",
     "- Use the example only to disambiguate the sense.",
     "",
     "Rules for exampleJa:",
@@ -233,6 +238,7 @@ function buildSenseTranslationPrompt(items: TranslationSourceItem[]): string {
     JSON.stringify(
       items.map((item) => ({
         id: item.id,
+        headword: item.headword,
         partOfSpeech: item.partOfSpeech,
         definitionEn: item.definitionEn,
         exampleEn: item.exampleEn,
@@ -424,7 +430,7 @@ async function translateChunk(
     {
       role: "system",
       content:
-        "You translate learner-friendly English dictionary content into concise natural Japanese. Return JSON only.",
+        "You translate learner-friendly English dictionary content into concise natural Japanese. The headword field tells you which word is being defined — use it to disambiguate domain-specific or polysemous terms (e.g. 'sheet' in a sailing context means a rope, not bedding). Return JSON only.",
     },
     {
       role: "user",
