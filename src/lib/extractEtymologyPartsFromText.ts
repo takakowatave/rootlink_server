@@ -120,19 +120,28 @@ export async function extractEtymologyPartsFromText(input: {
   }
 
   const prompt = [
-    "Extract morpheme etymology parts from the following English word.",
+    "You are an expert English etymologist. Extract meaningful morpheme parts from the etymology of the following word.",
     "",
     `Headword: ${headword}`,
     `Etymology: ${rawEtymology}`,
     "",
     "Instructions:",
-    "- Identify prefixes, roots, and suffixes that appear in the headword AND are mentioned or implied in the etymology text.",
-    "- For each part provide: value (the morpheme text), type (prefix/root/suffix), meaningEn (brief English, 1-5 words), meaningJa (Japanese, 1-5 words).",
-    "- Only extract parts genuinely supported by the etymology text.",
-    "- Do not extract parts not present in the etymology.",
+    "- Identify prefixes, roots, and suffixes that appear in the headword AND are supported by the etymology text.",
+    "- For each part provide: value (the morpheme as it appears in the headword), type (prefix/root/suffix), meaningEn (1-5 words), meaningJa (Japanese, 1-5 words).",
+    "- IMPORTANT: For meaningEn, give the morpheme's original base/lemma meaning — NOT the inflected or contextual form from the etymology sentence.",
+    "  e.g. 'competit-' in 'competitive' → meaningEn: 'to seek, aim' (not 'striven for')",
+    "  e.g. 'pon' in 'component' → meaningEn: 'to place' (not 'placing')",
+    "- If a root mentioned in the etymology is itself composed of smaller parts visible in the headword (e.g. 'competere' = 'com' + 'petere'), break it into those smaller parts.",
+    "- Use clean morpheme values without trailing hyphens (e.g. 'com' not 'com-', 'ive' not '-ive').",
+    "- Only extract parts genuinely supported by the etymology text. Do not invent parts.",
     "",
-    'Return JSON only: {"parts":[{"value":"com","type":"prefix","meaningEn":"together","meaningJa":"共に"},{"value":"pon","type":"root","meaningEn":"to place","meaningJa":"置く"}]}',
-    "If no parts can be extracted, return: {\"parts\":[]}",
+    "Good example for 'competitive':",
+    '{"parts":[{"value":"com","type":"prefix","meaningEn":"together","meaningJa":"共に"},{"value":"petit","type":"root","meaningEn":"to seek, aim for","meaningJa":"求める"},{"value":"ive","type":"suffix","meaningEn":"tending to","meaningJa":"〜の性質を持つ"}]}',
+    "",
+    "Good example for 'component':",
+    '{"parts":[{"value":"com","type":"prefix","meaningEn":"together","meaningJa":"共に"},{"value":"pon","type":"root","meaningEn":"to place","meaningJa":"置く"}]}',
+    "",
+    "Return JSON only. If no parts can be extracted, return: {\"parts\":[]}",
   ].join("\n")
 
   let aiParts: AiPart[] = []
