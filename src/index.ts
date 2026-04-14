@@ -3,6 +3,7 @@ import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { serve } from "@hono/node-server";
 import auth from "./routes/auth.js";
+import stripe from "./routes/stripe.js";
 import { resolveQuery } from "./lib/resolveQuery.js";
 import { getSupabase } from "./lib/supabase.js";
 import { generateTTS } from "./lib/generateTTS.js";
@@ -41,6 +42,7 @@ app.get("/", (c) => c.text("OK"));
  * 3. Routes
  * ========================= */
 app.route("/auth", auth);
+app.route("/stripe", stripe);
 
 
 /* =========================
