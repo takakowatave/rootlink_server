@@ -90,7 +90,51 @@ function assertOpenAIEnv(): void {
    OpenAI
 ========================= */
 
+/** OpenAI にスペル補正を依頼する。正しいスペルなら null を返す。 */
+async function correctSpelling(word: string): Promise<string | null> {
+  assertOpenAIEnv()
 
+  const res = await fetch(OPENAI_API_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+    },
+    body: JSON.stringify({
+      model: OPENAI_MODEL,
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a spelling corrector. If the input word is misspelled, return only the correctly spelled English word in lowercase. If it is already correct or not a real English word, return null. Respond with JSON: {\"corrected\": \"word\"} or {\"corrected\": null}.",
+        },
+        { role: "user", content: word },
+      ],
+      response_format: { type: "json_object" },
+      temperature: 0,
+    }),
+  })
+
+  if (!res.ok) return null
+
+  const data: unknown = await res.json()
+  if (!isRecord(data)) return null
+
+  const choices = Array.isArray(data.choices) ? data.choices : []
+  const message = isRecord(choices[0]) ? choices[0].message : null
+  if (!isRecord(message)) return null
+
+  const content = readString(message.content)
+  try {
+    const parsed: unknown = JSON.parse(content)
+    if (!isRecord(parsed)) return null
+    const corrected = parsed.corrected
+    if (typeof corrected !== "string" || corrected === word) return null
+    return corrected.toLowerCase().trim()
+  } catch {
+    return null
+  }
+}
 
 /* =========================
    Oxford API
@@ -501,6 +545,7 @@ export type ResolveResult =
       changed: boolean
       redirectTo: string
       dictionary: RewrittenDictionary
+      correctedFrom?: string
     }
   | {
       ok: false
@@ -526,6 +571,30 @@ async function resolveQueryInternal(raw: string): Promise<ResolveResult> {
         changed: direct.resolved !== input,
         redirectTo: `/word/${direct.resolved}`,
         dictionary: direct.dictionary,
+      }
+    }
+
+    // Oxford に見つからない場合、OpenAI でスペル補正を試みる
+    console.log("SPELL CORRECTION ATTEMPT:", input)
+    const corrected = await correctSpelling(input).catch((error: unknown) => {
+      console.error("SPELL CORRECTION FAILED:", error)
+      return null
+    })
+
+    if (corrected && corrected !== input) {
+      console.log("SPELL CORRECTED:", input, "->", corrected)
+      const correctedCandidates = buildLookupCandidates(corrected)
+      const correctedResult = await resolveFromCandidates(correctedCandidates)
+
+      if (correctedResult) {
+        return {
+          ok: true,
+          resolved: correctedResult.resolved,
+          changed: true,
+          redirectTo: `/word/${correctedResult.resolved}`,
+          dictionary: correctedResult.dictionary,
+          correctedFrom: input,
+        }
       }
     }
 

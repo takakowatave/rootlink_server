@@ -4,6 +4,8 @@ import { cors } from "hono/cors";
 import { serve } from "@hono/node-server";
 import auth from "./routes/auth.js";
 import { resolveQuery } from "./lib/resolveQuery.js";
+import { getSupabase } from "./lib/supabase.js";
+import { generateTTS } from "./lib/generateTTS.js";
 
 const app = new Hono();
 
@@ -20,6 +22,8 @@ app.use(
       if (origin.endsWith(".vercel.app")) return origin;
       if (origin === "https://rootlink.vercel.app") return origin;
       if (origin === "https://www.rootlink.jp") return origin;
+      if (origin === "https://www.rootlink.app") return origin;
+      if (origin === "https://rootlink.app") return origin;
 
       return null; // 明示的に拒否
     },
@@ -74,7 +78,69 @@ app.post("/resolve", async (c) => {
 })
 
 /* =========================
- * 5. Chat (AI Executor)
+ * 5. Audio (TTS on demand)
+ * ========================= */
+app.post("/audio", async (c) => {
+  try {
+    const body = await c.req.json()
+    const word: string = body.word
+
+    if (!word) return c.json({ ok: false, reason: "MISSING_WORD" }, 400)
+
+    const supabase = getSupabase()
+
+    // キャッシュ確認
+    const { data: wordRow } = await supabase
+      .from("words")
+      .select("id")
+      .eq("word", word)
+      .maybeSingle()
+
+    if (wordRow?.id) {
+      const { data: cached } = await supabase
+        .from("dictionary_cache")
+        .select("payload")
+        .eq("word_id", wordRow.id)
+        .maybeSingle()
+
+      if (cached?.payload?.audio?.audioPath) {
+        const supabaseUrl = process.env.SUPABASE_URL!
+        const audioUrl = `${supabaseUrl}/storage/v1/object/public/${cached.payload.audio.audioPath}`
+        return c.json({ ok: true, audioUrl })
+      }
+    }
+
+    // 生成
+    const audioPath = await generateTTS(word)
+    if (!audioPath) return c.json({ ok: false, reason: "TTS_FAILED" }, 500)
+
+    // payloadに保存
+    if (wordRow?.id) {
+      const { data: cached } = await supabase
+        .from("dictionary_cache")
+        .select("payload")
+        .eq("word_id", wordRow.id)
+        .maybeSingle()
+
+      if (cached?.payload) {
+        await supabase
+          .from("dictionary_cache")
+          .update({ payload: { ...cached.payload, audio: { audioPath } } })
+          .eq("word_id", wordRow.id)
+      }
+    }
+
+    const supabaseUrl = process.env.SUPABASE_URL!
+    const audioUrl = `${supabaseUrl}/storage/v1/object/public/${audioPath}`
+    return c.json({ ok: true, audioUrl })
+  } catch (error) {
+    console.error("AUDIO HANDLER FAILED:", error)
+    return c.json({ ok: false, reason: "INTERNAL_ERROR" }, 500)
+  }
+})
+
+/* =========================
+ * 6. Chat (AI Executor)
  * =========================
  * - プロンプトはフロントから受け取る
  * - server は OpenAI API を叩くだけ
@@ -82,6 +148,14 @@ app.post("/resolve", async (c) => {
  */
 app.post("/chat", async (c) => {
   try {
+    // ログイン済みユーザーのみ許可
+    const token = c.req.header("Authorization")?.replace("Bearer ", "")
+    if (!token) return c.json({ error: "Unauthorized" }, 401)
+
+    const supabase = getSupabase()
+    const { data: { user } } = await supabase.auth.getUser(token)
+    if (!user) return c.json({ error: "Unauthorized" }, 401)
+
     const body = await c.req.json();
 
     const prompt = body?.prompt;
