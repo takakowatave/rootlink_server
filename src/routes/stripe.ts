@@ -57,6 +57,46 @@ router.post("/checkout", async (c) => {
 })
 
 /* =========================
+ * POST /stripe/portal
+ * カスタマーポータルセッションを作成して URL を返す
+ * Body: { origin?: string }
+ * ========================= */
+router.post("/portal", async (c) => {
+  try {
+    const token = c.req.header("Authorization")?.replace("Bearer ", "")
+    if (!token) return c.json({ ok: false, reason: "UNAUTHORIZED" }, 401)
+
+    const supabase = getSupabase()
+    const { data: { user } } = await supabase.auth.getUser(token)
+    if (!user) return c.json({ ok: false, reason: "UNAUTHORIZED" }, 401)
+
+    const body = await c.req.json().catch(() => ({}))
+    const origin = body.origin ?? FRONTEND_URL
+
+    // subscriptions から stripe_customer_id を取得
+    const { data: sub } = await supabase
+      .from("subscriptions")
+      .select("stripe_customer_id")
+      .eq("user_id", user.id)
+      .maybeSingle()
+
+    if (!sub?.stripe_customer_id) {
+      return c.json({ ok: false, reason: "NO_SUBSCRIPTION" }, 404)
+    }
+
+    const session = await stripe.billingPortal.sessions.create({
+      customer: sub.stripe_customer_id,
+      return_url: `${origin}/wordlist`,
+    })
+
+    return c.json({ ok: true, url: session.url })
+  } catch (error) {
+    console.error("STRIPE PORTAL FAILED:", error)
+    return c.json({ ok: false, reason: "INTERNAL_ERROR" }, 500)
+  }
+})
+
+/* =========================
  * POST /stripe/webhook
  * Stripe からのイベントを受け取り Supabase を更新する
  * ========================= */
