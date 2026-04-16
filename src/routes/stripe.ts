@@ -36,12 +36,15 @@ router.post("/checkout", async (c) => {
       return c.json({ ok: false, reason: "INVALID_PLAN" }, 400)
     }
 
+    // フロントから渡されたoriginを優先（テスト環境対応）
+    const origin = body.origin ?? FRONTEND_URL
+
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
       payment_method_types: ["card"],
       line_items: [{ price: PRICE_IDS[plan], quantity: 1 }],
-      success_url: `${FRONTEND_URL}/premium/success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${FRONTEND_URL}/wordlist`,
+      success_url: `${origin}/premium/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${origin}/wordlist`,
       client_reference_id: user.id,
       metadata: { user_id: user.id, plan },
     })
