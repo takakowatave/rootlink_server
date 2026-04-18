@@ -1,7 +1,7 @@
 import { createClient } from "@supabase/supabase-js";
 export function getSupabase() {
-    const url = process.env.SUPABASE_URL_ROOTLINK;
-    const key = process.env.SUPABASE_SERVICE_ROLE_KEY_ROOTLINK;
+    const url = process.env.SUPABASE_URL;
+    const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
     if (!url || !key) {
         throw new Error("Supabase env is missing");
     }

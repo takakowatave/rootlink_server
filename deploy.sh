@@ -3,6 +3,7 @@ set -e
 
 : "${SUPABASE_URL:?SUPABASE_URL is required}"
 : "${SUPABASE_ANON_KEY:?SUPABASE_ANON_KEY is required}"
+: "${SUPABASE_SERVICE_ROLE_KEY:?SUPABASE_SERVICE_ROLE_KEY is required}"
 
 gcloud run deploy rootlink-server-v2 \
   --source . \
@@ -10,4 +11,4 @@ gcloud run deploy rootlink-server-v2 \
   --allow-unauthenticated \
   --clear-base-image \
   --set-build-env-vars="SUPABASE_URL=${SUPABASE_URL},SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}" \
-  --set-env-vars="SUPABASE_URL=${SUPABASE_URL},SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}"
+  --update-env-vars="SUPABASE_URL=${SUPABASE_URL},SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY},SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}"

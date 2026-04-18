@@ -730,7 +730,7 @@ function extractSenseGroups(
   return [...posMap.entries()]
     .map(([partOfSpeech, rawSenses]) => {
       const totalSenseCount = rawSenses.length
-      const shownSenses = rawSenses.slice(0, 3)
+      const shownSenses = rawSenses.slice(0, 14)
 
       return {
         partOfSpeech,

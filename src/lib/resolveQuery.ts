@@ -9,6 +9,7 @@ import {
 } from "../lib/rewriteDictionary.js"
 import { getLemma } from "./lemma.js"
 import { generateSensesAI } from "./generateSensesAI.js"
+import { rerankSensesForLearners } from "./rerankSensesForLearners.js"
 
 /**
  * resolveQuery.ts
@@ -520,8 +521,12 @@ async function resolveFromCandidates(
     const normalized = await buildNormalizedDictionary(headword, entries)
     console.log("NORMALIZE DONE:", headword)
 
+    console.log("RERANK START:", headword)
+    const reranked = await rerankSensesForLearners(normalized)
+    console.log("RERANK DONE:", headword)
+
     console.log("REWRITE START:", headword)
-    const dictionary = await rewriteDictionary(normalized)
+    const dictionary = await rewriteDictionary(reranked)
     console.log("REWRITE DONE:", headword)
 
     console.log("CACHE SAVE START:", headword)

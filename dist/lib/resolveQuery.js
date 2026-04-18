@@ -1,145 +1,375 @@
-// lib/resolveQuery.ts
-import { normalizeWord, normalizeLexicalUnit } from "./normalize.js";
-function isSingleWord(s) {
-    return /^[a-z]+$/.test(s);
-}
-function isWordToken(s) {
-    return /^[a-z]+$/.test(s);
-}
-/* =========================
-   Oxford Sandbox Base URL
-========================= */
+import { normalizeWord } from "./normalize.js";
+import { getSupabase } from "../lib/supabase.js";
+import { generateDerivatives } from "../lib/generateDerivatives.js";
+import { normalizeDictionary } from "../lib/normalizeDictionary.js";
+import { rewriteDictionary, } from "../lib/rewriteDictionary.js";
+import { generateSensesAI } from "./generateSensesAI.js";
 const BASE_URL = "https://od-api.oxforddictionaries.com/api/v2";
+const OPENAI_API_URL = process.env.OPENAI_API_URL ?? "https://api.openai.com/v1/chat/completions";
+const OPENAI_MODEL = process.env.OPENAI_TEXT_MODEL ?? process.env.OPENAI_MODEL ?? "gpt-4.1-mini";
+const inFlightResolves = new Map();
 /* =========================
-   Oxford API 呼び出し
+   Shared helpers
 ========================= */
-async function fetchDictionary(word, cache) {
+/** 文字列だけを残して trim + 重複除去する。 */
+function uniqueStrings(values) {
+    return [
+        ...new Set(values
+            .filter((value) => typeof value === "string")
+            .map((value) => value.trim())
+            .filter((value) => value.length > 0)),
+    ];
+}
+/** unknown から安全に文字列を読む。 */
+function readString(value) {
+    return typeof value === "string" ? value.trim() : "";
+}
+/** unknown が object かを判定する。 */
+function isRecord(value) {
+    return typeof value === "object" && value !== null;
+}
+class OxfordUsageLimitError extends Error {
+    constructor() {
+        super("OXFORD_USAGE_LIMIT_EXCEEDED");
+        this.name = "OxfordUsageLimitError";
+    }
+}
+function assertOpenAIEnv() {
+    if (!process.env.OPENAI_API_KEY) {
+        throw new Error("OPENAI_API_KEY is required");
+    }
+}
+/* =========================
+   OpenAI
+========================= */
+/* =========================
+   Oxford API
+========================= */
+/** entries を取得する。Oxford raw は保存せず、正規化処理へ渡す。 */
+async function fetchEntries(word) {
+    console.log("OXFORD ENTRIES START:", word);
+    const url = `${BASE_URL}/entries/en-gb/${encodeURIComponent(word)}`;
+    const res = await fetch(url, {
+        headers: {
+            app_id: process.env.OXFORD_APP_ID ?? "",
+            app_key: process.env.OXFORD_APP_KEY ?? "",
+        },
+        cache: "no-store",
+    });
+    console.log("OXFORD ENTRIES STATUS:", word, res.status);
+    if (!res.ok) {
+        const text = await res.text();
+        console.error("OXFORD ENTRIES FAILED:", {
+            word,
+            status: res.status,
+            body: text,
+        });
+        if (res.status === 429) {
+            throw new OxfordUsageLimitError();
+        }
+        return null;
+    }
+    const json = await res.json();
+    console.log("OXFORD ENTRIES OK:", word);
+    return json;
+}
+/** inflections API から活用形だけを抽出して返す。 */
+async function fetchInflections(word) {
+    console.log("OXFORD INFLECTIONS:", word);
+    const res = await fetch(`${BASE_URL}/inflections/en-gb/${encodeURIComponent(word)}`, {
+        headers: {
+            app_id: process.env.OXFORD_APP_ID ?? "",
+            app_key: process.env.OXFORD_APP_KEY ?? "",
+        },
+        cache: "no-store",
+    });
+    if (!res.ok)
+        return [];
+    const data = await res.json();
+    if (!isRecord(data))
+        return [];
+    const results = Array.isArray(data.results) ? data.results : [];
+    const forms = results.flatMap((result) => {
+        if (!isRecord(result))
+            return [];
+        const lexicalEntries = Array.isArray(result.lexicalEntries)
+            ? result.lexicalEntries
+            : [];
+        return lexicalEntries.flatMap((lexicalEntry) => {
+            if (!isRecord(lexicalEntry))
+                return [];
+            const inflections = Array.isArray(lexicalEntry.inflections)
+                ? lexicalEntry.inflections
+                : [];
+            return inflections
+                .map((inflection) => isRecord(inflection) ? readString(inflection.inflectedForm) : "")
+                .filter((value) => value.length > 0);
+        });
+    });
+    return uniqueStrings(forms);
+}
+/** Oxford entries の results[0].id から実headwordを読む。 */
+function extractHeadword(entries) {
+    if (!isRecord(entries))
+        return null;
+    const results = Array.isArray(entries.results) ? entries.results : [];
+    const first = results[0];
+    if (!isRecord(first))
+        return null;
+    const id = first.id;
+    return typeof id === "string" ? id.trim().toLowerCase() : null;
+}
+/* =========================
+   Datamuse suggestion
+========================= */
+/** typo 候補を 1 件だけ返す。 */
+async function getSuggestion(word, cache) {
     if (cache.has(word)) {
         return cache.get(word) ?? null;
     }
-    try {
-        console.log("=== OXFORD FETCH START ===", word);
-        console.log("APP_ID exists:", !!process.env.OXFORD_APP_ID);
-        console.log("APP_KEY exists:", !!process.env.OXFORD_APP_KEY);
-        const res = await fetch(`${BASE_URL}/entries/en-gb/${encodeURIComponent(word)}`, {
-            headers: {
-                app_id: process.env.OXFORD_APP_ID,
-                app_key: process.env.OXFORD_APP_KEY,
-            },
-            cache: "no-store",
-        });
-        console.log("OXFORD STATUS:", res.status);
-        const rawText = await res.text();
-        console.log("OXFORD RAW TEXT:", rawText);
-        if (!res.ok) {
-            cache.set(word, null);
-            return null;
-        }
-        const data = JSON.parse(rawText);
-        console.log("OXFORD RAW JSON:", JSON.stringify(data, null, 2));
-        if (!data?.results?.length) {
-            cache.set(word, null);
-            return null;
-        }
-        cache.set(word, data);
-        return data;
-    }
-    catch (e) {
-        console.error("OXFORD FETCH ERROR:", e);
-        cache.set(word, null);
-        return null;
-    }
-}
-/* =========================
-   Datamuse typo suggestion
-========================= */
-async function getSuggestion(word, cache) {
-    if (cache.has(word))
-        return cache.get(word) ?? null;
-    const res = await fetch(`https://api.datamuse.com/sug?s=${encodeURIComponent(word)}&max=1`, { cache: "no-store" });
+    const res = await fetch(`https://api.datamuse.com/sug?s=${encodeURIComponent(word)}&max=1`);
     if (!res.ok) {
         cache.set(word, null);
         return null;
     }
     const data = await res.json();
-    const cand = (data?.[0]?.word ?? "").toLowerCase();
-    if (!cand || !isSingleWord(cand) || cand === word) {
+    if (!Array.isArray(data)) {
         cache.set(word, null);
         return null;
     }
-    cache.set(word, cand);
-    return cand;
+    const first = data[0];
+    const suggestion = isRecord(first)
+        ? readString(first.word).toLowerCase()
+        : "";
+    if (!suggestion || suggestion === word) {
+        cache.set(word, null);
+        return null;
+    }
+    cache.set(word, suggestion);
+    return suggestion;
 }
 /* =========================
-   単語解決
+   DB helpers
 ========================= */
-async function resolveWord(raw, dictCache, suggestCache) {
-    const normalized = normalizeWord(raw);
-    if (!isSingleWord(normalized))
+/** words テーブルから word の id を取る。 */
+async function findWordId(word) {
+    const supabase = getSupabase();
+    const { data, error } = await supabase
+        .from("words")
+        .select("id")
+        .eq("word", word)
+        .maybeSingle();
+    if (error) {
+        console.error("FIND WORD ID FAILED:", error);
         return null;
-    const dict = await fetchDictionary(normalized, dictCache);
-    if (dict) {
-        return { resolved: normalized, dictionary: dict };
     }
-    const suggestion = await getSuggestion(normalized, suggestCache);
-    if (!suggestion)
+    if (!isRecord(data))
         return null;
-    const dict2 = await fetchDictionary(suggestion, dictCache);
-    if (dict2) {
-        return { resolved: suggestion, dictionary: dict2 };
+    const row = data;
+    return typeof row.id === "string" ? row.id : null;
+}
+/** words に語がなければ作って id を返す。 */
+async function ensureWordId(word) {
+    const existingId = await findWordId(word);
+    if (existingId)
+        return existingId;
+    const supabase = getSupabase();
+    const { data, error } = await supabase
+        .from('words')
+        .insert({ word })
+        .select('id')
+        .single();
+    if (error || !isRecord(data) || typeof data.id !== "string") {
+        throw new Error(`FAILED TO INSERT WORD: ${word}`);
+    }
+    return data.id;
+}
+/** dictionary_cache から完成済み payload を読む。 */
+async function getCachedDictionary(word) {
+    const supabase = getSupabase();
+    const wordId = await findWordId(word);
+    if (!wordId)
+        return null;
+    const { data, error } = await supabase
+        .from("dictionary_cache")
+        .select("payload")
+        .eq("word_id", wordId)
+        .limit(1)
+        .maybeSingle();
+    if (error) {
+        console.error("CACHE READ FAILED:", error);
+        return null;
+    }
+    if (!isRecord(data))
+        return null;
+    const row = data;
+    if (!isRecord(row.payload))
+        return null;
+    return row.payload;
+}
+/** 完成済み payload だけを保存する。 */
+async function saveDictionary(word, payload) {
+    const supabase = getSupabase();
+    const wordId = await ensureWordId(word);
+    const { error } = await supabase.from("dictionary_cache").upsert({
+        word_id: wordId,
+        payload,
+    });
+    if (error) {
+        throw error;
+    }
+}
+/* =========================
+   Resolve helpers
+========================= */
+/** lookup 候補を作る。phrase を先に試し、だめなら先頭語も試す。 */
+function buildLookupCandidates(input) {
+    const values = [input];
+    if (input.includes(" ")) {
+        const [headword] = input.split(/\s+/);
+        values.push(headword);
+    }
+    return uniqueStrings(values);
+}
+/**
+ * Oxford の sense データが不十分かどうか判定する。
+ *
+ * 以下のいずれかに該当する場合に GPT 補完を発動する:
+ * 1. senseGroups が空（turtle のように Oxford が何も返さなかった場合）
+ * 2. 全 sense に registerCodes があり、中立な sense が一つもない
+ *    （goat のように informal/derogatory しか返さなかった場合）
+ */
+function needsSenseFallback(senseGroups) {
+    if (senseGroups.length === 0)
+        return true;
+    const allSenses = senseGroups.flatMap((g) => g.senses);
+    if (allSenses.length === 0)
+        return true;
+    // registerCodes が空 = 中立な sense（informal/derogatory でない）
+    const hasNeutralSense = allSenses.some((s) => s.registerCodes.length === 0);
+    return !hasNeutralSense;
+}
+/** Oxford から整形に必要な材料を集める。 */
+async function buildNormalizedDictionary(candidate, entries) {
+    const supabase = getSupabase();
+    // 語源パーツ取得
+    const { data: partsRowsRaw } = await supabase
+        .from("etymology_parts")
+        .select("*")
+        .eq("is_active", true)
+        .order("sort_order");
+    const { data: glossRowsRaw } = await supabase
+        .from("etymology_part_glosses")
+        .select("*")
+        .order("sort_order");
+    const partsRows = Array.isArray(partsRowsRaw) ? partsRowsRaw : [];
+    const glossRows = Array.isArray(glossRowsRaw) ? glossRowsRaw : [];
+    const [inflections, derivatives] = await Promise.all([
+        fetchInflections(candidate),
+        generateDerivatives(candidate).catch((error) => {
+            console.error("GENERATE DERIVATIVES FAILED:", error);
+            return [];
+        }),
+    ]);
+    const normalized = await normalizeDictionary({
+        word: candidate,
+        entries,
+        inflections,
+        derivatives: uniqueStrings(derivatives),
+        lexicalUnits: [],
+        partsRows,
+        glossRows,
+    });
+    // Oxford データが貧弱な場合は GPT で sense を補完する
+    // 生成した sense を先頭に置き、Oxford の register 付き sense を後ろに続ける
+    if (needsSenseFallback(normalized.senseGroups)) {
+        console.log("SENSE FALLBACK TRIGGERED:", candidate);
+        const generatedGroups = await generateSensesAI({
+            word: candidate,
+            etymologyHint: normalized.etymology,
+        });
+        return {
+            ...normalized,
+            senseGroups: [...generatedGroups, ...normalized.senseGroups],
+        };
+    }
+    return normalized;
+}
+/** 候補を順に調べ、cache hit なら返し、miss なら Oxford -> normalize -> rewrite -> 保存する。 */
+async function resolveFromCandidates(candidates) {
+    for (const candidate of candidates) {
+        const cached = await getCachedDictionary(candidate);
+        if (cached) {
+            console.log("DICTIONARY CACHE HIT:", candidate);
+            return { resolved: candidate, dictionary: cached };
+        }
+        console.log("DICTIONARY CACHE MISS:", candidate);
+        const entries = await fetchEntries(candidate);
+        if (!entries) {
+            console.log("OXFORD NO ENTRIES:", candidate);
+            continue;
+        }
+        // Oxford が返した実headwordを最優先で使う
+        const headword = extractHeadword(entries) ?? candidate;
+        console.log("OXFORD HEADWORD:", { candidate, headword });
+        // もし candidate ではなく headword 側の cache が既にあるならそれを返す
+        if (headword !== candidate) {
+            const canonicalCached = await getCachedDictionary(headword);
+            if (canonicalCached) {
+                console.log("DICTIONARY CACHE HIT BY HEADWORD:", headword);
+                return { resolved: headword, dictionary: canonicalCached };
+            }
+        }
+        console.log("NORMALIZE START:", headword);
+        const normalized = await buildNormalizedDictionary(headword, entries);
+        console.log("NORMALIZE DONE:", headword);
+        console.log("REWRITE START:", headword);
+        const dictionary = await rewriteDictionary(normalized);
+        console.log("REWRITE DONE:", headword);
+        console.log("CACHE SAVE START:", headword);
+        await saveDictionary(headword, dictionary);
+        console.log("DICTIONARY CACHE SAVED:", headword);
+        return { resolved: headword, dictionary };
     }
     return null;
 }
-/* =========================
-   熟語解決
-========================= */
-async function resolveLexicalUnit(raw, dictCache, suggestCache) {
-    const normalized = normalizeLexicalUnit(raw);
-    const tokens = normalized.split(/(\s+|-)/);
-    for (let i = 0; i < tokens.length; i++) {
-        const t = tokens[i];
-        if (t.trim() === "" || t === "-" || /^\s+$/.test(t))
-            continue;
-        if (!isWordToken(t))
-            continue;
-        const exists = await fetchDictionary(t, dictCache);
-        if (exists)
-            continue;
-        const suggestion = await getSuggestion(t, suggestCache);
-        if (!suggestion)
-            return null;
-        const exists2 = await fetchDictionary(suggestion, dictCache);
-        if (!exists2)
-            return null;
-        tokens[i] = suggestion;
+/** 検索本体。exact/headword -> suggestion の順で解決する。 */
+async function resolveQueryInternal(raw) {
+    try {
+        console.log("RESOLVE QUERY START:", raw);
+        const input = raw.trim().toLowerCase();
+        const normalized = normalizeWord(input);
+        const candidates = buildLookupCandidates(normalized);
+        const direct = await resolveFromCandidates(candidates);
+        if (direct) {
+            return {
+                ok: true,
+                resolved: direct.resolved,
+                changed: direct.resolved !== input,
+                redirectTo: `/word/${direct.resolved}`,
+                dictionary: direct.dictionary,
+            };
+        }
+        return { ok: false, reason: "NO_RESULT" };
     }
-    return tokens.join("");
+    catch (error) {
+        if (error instanceof OxfordUsageLimitError) {
+            console.error("OXFORD USAGE LIMIT EXCEEDED");
+            throw error;
+        }
+        throw error;
+    }
 }
 export async function resolveQuery(raw) {
-    const input = raw.trim().toLowerCase();
-    const dictCache = new Map();
-    const suggestCache = new Map();
-    if (isSingleWord(input)) {
-        const result = await resolveWord(input, dictCache, suggestCache);
-        if (!result)
-            return { ok: false, reason: "NO_SUGGESTION" };
-        return {
-            ok: true,
-            resolved: result.resolved,
-            changed: result.resolved !== input,
-            kind: "word",
-            redirectTo: `/word/${result.resolved}`,
-            dictionary: result.dictionary,
-        };
+    const key = normalizeWord(raw.trim().toLowerCase());
+    const existing = inFlightResolves.get(key);
+    if (existing) {
+        console.log("RESOLVE QUERY JOIN:", key);
+        return existing;
     }
-    const resolvedLU = await resolveLexicalUnit(input, dictCache, suggestCache);
-    if (!resolvedLU)
-        return { ok: false, reason: "NO_SUGGESTION" };
-    return {
-        ok: true,
-        resolved: resolvedLU,
-        changed: resolvedLU !== input,
-        kind: "lexical_unit",
-        redirectTo: `/lexical-unit/${resolvedLU.replace(/\s+/g, "-")}`,
-    };
+    const promise = resolveQueryInternal(raw).finally(() => {
+        inFlightResolves.delete(key);
+    });
+    inFlightResolves.set(key, promise);
+    return promise;
 }

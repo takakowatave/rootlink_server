@@ -4,6 +4,7 @@ import { cors } from "hono/cors";
 import { serve } from "@hono/node-server";
 import auth from "./routes/auth.js";
 import { resolveQuery } from "./lib/resolveQuery.js";
+import { getSupabase } from "./lib/supabase.js";
 const app = new Hono();
 /* =========================
  * 1. CORS
@@ -39,16 +40,22 @@ app.route("/auth", auth);
 app.post("/resolve", async (c) => {
     try {
         const body = await c.req.json();
-        const input = body?.query;
-        if (!input) {
-            return c.json({ error: "query required" }, 400);
-        }
-        const result = await resolveQuery(input);
+        const result = await resolveQuery(body.query);
         return c.json(result);
     }
-    catch (err) {
-        console.error(err);
-        return c.json({ error: "resolve failed" }, 500);
+    catch (error) {
+        if (error instanceof Error &&
+            error.name === "OxfordUsageLimitError") {
+            return c.json({
+                ok: false,
+                reason: "UNAVAILABLE",
+            }, 503);
+        }
+        console.error("RESOLVE HANDLER FAILED:", error);
+        return c.json({
+            ok: false,
+            reason: "INTERNAL_ERROR",
+        }, 500);
     }
 });
 /* =========================
@@ -60,6 +67,14 @@ app.post("/resolve", async (c) => {
  */
 app.post("/chat", async (c) => {
     try {
+        // ログイン済みユーザーのみ許可
+        const token = c.req.header("Authorization")?.replace("Bearer ", "");
+        if (!token)
+            return c.json({ error: "Unauthorized" }, 401);
+        const supabase = getSupabase();
+        const { data: { user } } = await supabase.auth.getUser(token);
+        if (!user)
+            return c.json({ error: "Unauthorized" }, 401);
         const body = await c.req.json();
         const prompt = body?.prompt;
         if (!prompt || typeof prompt !== "string") {

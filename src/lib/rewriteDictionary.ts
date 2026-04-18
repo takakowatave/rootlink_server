@@ -57,6 +57,7 @@ export type RewrittenDictionary = {
   etymology: string | null
   etymologyData: EtymologyData | null
   locales: Partial<Record<SupportedLocale, LocalePayload>>
+  audio?: { audioPath: string }
 }
 
 const SCHEMA_VERSION = 3
