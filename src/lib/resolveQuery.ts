@@ -368,6 +368,20 @@ async function saveDictionary(
   if (error) {
     throw error
   }
+
+  // 語源パーツ × 単語のマッピングを蓄積
+  if (payload.etymologyData?.structure.type === "parts") {
+    const rows = payload.etymologyData.structure.parts
+      .map((p) => p.text.toLowerCase().trim())
+      .filter((t) => t.length > 0)
+      .map((part_text) => ({ part_text, word: word.toLowerCase() }))
+
+    if (rows.length > 0) {
+      await supabase
+        .from("etymology_part_words")
+        .upsert(rows, { onConflict: "part_text,word" })
+    }
+  }
 }
 
 /* =========================
