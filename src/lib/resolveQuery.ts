@@ -397,6 +397,11 @@ function buildLookupCandidates(input: string): string[] {
     values.push(headword)
   }
 
+  // ハイフン語はアンダースコア形式も試す（Oxford は well_known 形式で登録）
+  if (input.includes("-")) {
+    values.push(input.replace(/-/g, "_"))
+  }
+
   return uniqueStrings(values)
 }
 
