@@ -402,6 +402,19 @@ function buildLookupCandidates(input: string): string[] {
     values.push(input.replace(/-/g, "_"))
   }
 
+  // ハイフンなし複合語 → ハイフンあり形式を試す（pileup → pile-up）
+  if (!input.includes("-") && !input.includes(" ") && !input.includes("_")) {
+    const COMPOUND_SUFFIXES = [
+      "up", "out", "in", "on", "off", "down", "over", "away", "back", "by", "through",
+    ]
+    for (const suffix of COMPOUND_SUFFIXES) {
+      if (input.endsWith(suffix) && input.length > suffix.length + 2) {
+        const stem = input.slice(0, input.length - suffix.length)
+        values.push(`${stem}-${suffix}`)
+      }
+    }
+  }
+
   return uniqueStrings(values)
 }
 
