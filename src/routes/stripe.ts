@@ -7,8 +7,8 @@ const stripe = new Stripe(process.env.STRIPE_SECRET_KEY ?? "", {
 })
 
 const PRICE_IDS = {
-  monthly: "price_1TM2anEAvnqttVka9rIBlaPM",
-  yearly: "price_1TM2bJEAvnqttVkaQ2gc0Itm",
+  monthly: "price_1TRNNWCXPVfAwU4gxbWNXur9",
+  yearly: "price_1TRNNVCXPVfAwU4gG92OlyyD",
 } as const
 
 type PlanName = keyof typeof PRICE_IDS
@@ -53,6 +53,8 @@ router.post("/checkout", async (c) => {
     // フロントから渡されたoriginを優先（テスト環境対応）
     const origin = body.origin ?? FRONTEND_URL
 
+    const locale = (body.locale as string) || "auto"
+
     const session = await stripe.checkout.sessions.create({
       mode: "subscription",
       payment_method_types: ["card"],
@@ -61,6 +63,7 @@ router.post("/checkout", async (c) => {
       cancel_url: `${origin}/wordlist`,
       client_reference_id: user.id,
       metadata: { user_id: user.id, plan },
+      locale: locale as "auto" | "ja" | "en",
     })
 
     return c.json({ ok: true, url: session.url })
