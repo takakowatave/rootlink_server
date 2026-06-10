@@ -86,8 +86,8 @@ export async function rewriteDictionary(
         senseNumber: sense.senseNumber,
         definition: rewrittenDefinition,
 
-        // example は必ず Oxford 原文を保持する
-        example: sense.example || null,
+        // Oxford 原文を優先し、なければ AI 生成例文を使う
+        example: sense.example || aiResult.generatedExamples.get(sense.senseId) || null,
 
         // patterns は今は無効化
         patterns: [],

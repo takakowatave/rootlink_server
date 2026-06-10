@@ -20,6 +20,24 @@ export type AISenseTranslation = {
   exampleTranslation: string | null
 }
 
+// AI が生成した英語例文。
+type GeneratedExampleItem = {
+  id?: string
+  example?: string
+}
+
+type GeneratedExamplesResponse = {
+  items?: GeneratedExampleItem[]
+}
+
+// 例文生成の入力 1 件。
+type ExampleGenerationItem = {
+  id: string
+  headword: string
+  partOfSpeech: string
+  definitionEn: string
+}
+
 // AI が返す日本語 etymology データ。
 export type AIEtymologyTranslation = {
   descriptionJa: string | null
@@ -32,6 +50,7 @@ export type RewriteDictionaryAIResult = {
   rewrittenDefinitions: Map<string, string>
   translatedSenses: Map<string, AISenseTranslation>
   translatedEtymology: AIEtymologyTranslation
+  generatedExamples: Map<string, string>
 }
 
 // 英語 rewrite に渡す入力 1 件。
@@ -247,6 +266,22 @@ function buildSenseTranslationPrompt(items: TranslationSourceItem[]): string {
   ].join("\n")
 }
 
+function buildExampleGenerationPrompt(items: ExampleGenerationItem[]): string {
+  return [
+    "Generate a single natural British English example sentence for each dictionary sense.",
+    "Rules:",
+    "- The sentence must clearly illustrate the given definition.",
+    "- Use everyday vocabulary. Keep sentences short (under 15 words).",
+    "- Do NOT use the headword itself in the sentence — use a pronoun or synonym.",
+    "- Return JSON only.",
+    "",
+    'Output format: {"items":[{"id":"...","example":"..."}]}',
+    "",
+    "Input:",
+    JSON.stringify(items),
+  ].join("\n")
+}
+
 // 語源説明文 / hook / sourceMeaning だけを日本語化する。
 function buildEtymologyTranslationPrompt(input: {
   word: string
@@ -447,6 +482,35 @@ async function translateChunk(
   return normaliseTranslationItems(parsed.items)
 }
 
+async function generateExamplesChunk(
+  items: ExampleGenerationItem[]
+): Promise<Map<string, string>> {
+  const content = await postOpenAI([
+    {
+      role: "system",
+      content:
+        "You generate natural British English example sentences for dictionary senses. Return JSON only.",
+    },
+    {
+      role: "user",
+      content: buildExampleGenerationPrompt(items),
+    },
+  ])
+
+  const parsed = safeJsonParse<GeneratedExamplesResponse>(content)
+  const result = new Map<string, string>()
+
+  if (!Array.isArray(parsed.items)) return result
+
+  for (const item of parsed.items) {
+    const id = readString(item.id)
+    const example = readString(item.example)
+    if (id && example) result.set(id, example)
+  }
+
+  return result
+}
+
 async function translateEtymology(input: {
   word: string
   descriptionEn: string | null
@@ -487,6 +551,7 @@ export async function rewriteDictionaryAI(
 ): Promise<RewriteDictionaryAIResult> {
   const rewrittenDefinitions = new Map<string, string>()
   const translatedSenses = new Map<string, AISenseTranslation>()
+  const generatedExamples = new Map<string, string>()
 
   const rewriteSources = buildRewriteSources(data)
 
@@ -499,7 +564,39 @@ export async function rewriteDictionaryAI(
     }
   }
 
-  const translationSources = buildTranslationSources(data, rewrittenDefinitions)
+  // 例文がない sense に対して AI で生成する
+  const sensesNeedingExamples: ExampleGenerationItem[] = []
+  for (const group of data.senseGroups) {
+    for (const sense of group.senses) {
+      if (!sense.example) {
+        const definitionEn =
+          rewrittenDefinitions.get(sense.senseId)?.trim() || sense.definition
+        if (definitionEn) {
+          sensesNeedingExamples.push({
+            id: sense.senseId,
+            headword: data.word,
+            partOfSpeech: group.partOfSpeech,
+            definitionEn,
+          })
+        }
+      }
+    }
+  }
+
+  for (const group of chunk(sensesNeedingExamples, CHUNK_SIZE)) {
+    const generated = await generateExamplesChunk(group)
+    for (const [id, example] of generated) {
+      generatedExamples.set(id, example)
+    }
+  }
+
+  // 翻訳ソースには生成例文も含める
+  const translationSources = buildTranslationSources(data, rewrittenDefinitions).map(
+    (item) => ({
+      ...item,
+      exampleEn: item.exampleEn ?? generatedExamples.get(item.id) ?? null,
+    })
+  )
 
   for (const group of chunk(translationSources, CHUNK_SIZE)) {
     const translatedItems = await translateChunk(group)
@@ -530,5 +627,6 @@ export async function rewriteDictionaryAI(
     rewrittenDefinitions,
     translatedSenses,
     translatedEtymology,
+    generatedExamples,
   }
 }
