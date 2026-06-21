@@ -536,36 +536,60 @@ async function resolveFromCandidates(
       continue
     }
 
-    // Oxford が返した実headwordを最優先で使う
+    // Oxford が返した実headwordを確認する（"regimented" → "regiment" のようなケース）
     const headword = extractHeadword(entries) ?? candidate
     console.log("OXFORD HEADWORD:", { candidate, headword })
 
-    // もし candidate ではなく headword 側の cache が既にあるならそれを返す
+    // headword が candidate と異なる場合（活用形・派生語）:
+    // candidate 側にキャッシュがあればそれを使う
     if (headword !== candidate) {
-      const canonicalCached = await getCachedDictionary(headword)
-      if (canonicalCached) {
+      const candidateCached = await getCachedDictionary(candidate)
+      if (candidateCached) {
+        console.log("DICTIONARY CACHE HIT BY CANDIDATE:", candidate)
+        return { resolved: candidate, dictionary: candidateCached }
+      }
+      // headword 側にキャッシュがあっても candidate で別途保存する（後述）
+    }
+
+    // headword 側のキャッシュ確認（headword == candidate の場合はここで return）
+    if (headword === candidate) {
+      const cached = await getCachedDictionary(headword)
+      if (cached) {
         console.log("DICTIONARY CACHE HIT BY HEADWORD:", headword)
-        return { resolved: headword, dictionary: canonicalCached }
+        return { resolved: headword, dictionary: cached }
       }
     }
 
-    console.log("NORMALIZE START:", headword)
-    const normalized = await buildNormalizedDictionary(headword, entries)
-    console.log("NORMALIZE DONE:", headword)
+    // candidate をベースに正規化する。
+    // Oxford のデータには "regimented" の形容詞 sense も含まれるため、
+    // headword ではなく candidate で正規化することで派生形固有の品詞情報を保持する。
+    console.log("NORMALIZE START:", candidate)
+    const normalized = await buildNormalizedDictionary(candidate, entries)
+    console.log("NORMALIZE DONE:", candidate)
 
-    console.log("RERANK START:", headword)
+    console.log("RERANK START:", candidate)
     const reranked = await rerankSensesForLearners(normalized)
-    console.log("RERANK DONE:", headword)
+    console.log("RERANK DONE:", candidate)
 
-    console.log("REWRITE START:", headword)
+    console.log("REWRITE START:", candidate)
     const dictionary = await rewriteDictionary(reranked)
-    console.log("REWRITE DONE:", headword)
+    console.log("REWRITE DONE:", candidate)
 
-    console.log("CACHE SAVE START:", headword)
-    await saveDictionary(headword, dictionary)
-    console.log("DICTIONARY CACHE SAVED:", headword)
+    // candidate で保存（例: "regimented"）
+    console.log("CACHE SAVE START:", candidate)
+    await saveDictionary(candidate, dictionary)
+    console.log("DICTIONARY CACHE SAVED:", candidate)
 
-    return { resolved: headword, dictionary }
+    // headword が異なる場合は headword 側にも同じ内容を保存しておく（重複 Oxford call 防止）
+    if (headword !== candidate) {
+      const headwordAlreadyCached = await getCachedDictionary(headword)
+      if (!headwordAlreadyCached) {
+        await saveDictionary(headword, dictionary)
+        console.log("DICTIONARY CACHE SAVED (headword alias):", headword)
+      }
+    }
+
+    return { resolved: candidate, dictionary }
   }
 
   return null
