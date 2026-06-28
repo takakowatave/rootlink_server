@@ -620,8 +620,15 @@ async function resolveQueryInternal(raw: string): Promise<ResolveResult> {
 
     const input = raw.trim().toLowerCase()
 
-    const normalized = normalizeWord(input)
-    const candidates = buildLookupCandidates(normalized)
+    // クエリされた原形を最優先で試す。Oxford に独立した見出しがある語
+    // （pleading / meeting / building など、-ing/-ed 形が名詞・形容詞でもある語）は
+    // その形のまま解決し、固有の品詞・語義を保持する。
+    // Oxford に見出しがなければ lemma（基本形）にフォールバックする。
+    const lemma = normalizeWord(input)
+    const candidates = uniqueStrings([
+      ...buildLookupCandidates(input),
+      ...(lemma !== input ? buildLookupCandidates(lemma) : []),
+    ])
 
     const direct = await resolveFromCandidates(candidates)
 
