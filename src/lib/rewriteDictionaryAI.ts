@@ -191,6 +191,7 @@ function buildSenseRewritePrompt(items: RewriteSourceItem[]): string {
   return [
     "Rewrite English dictionary definitions for an English-learning product.",
     "Rules:",
+    "- The 'headword' field tells you which word is being defined. Use it to ensure accuracy.",
     "- Keep the meaning faithful and preserve the CORE action/nuance of the word.",
     "- Do NOT generalise or abstract the meaning away from the source.",
     "  e.g. 'plead' = beg/implore earnestly -> keep that (NOT 'try to get sympathy or support').",
@@ -208,6 +209,7 @@ function buildSenseRewritePrompt(items: RewriteSourceItem[]): string {
     JSON.stringify(
       items.map((item) => ({
         id: item.id,
+        headword: item.headword,
         definition: item.sourceDefinition,
       }))
     ),

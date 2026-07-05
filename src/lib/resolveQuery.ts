@@ -580,15 +580,6 @@ async function resolveFromCandidates(
     await saveDictionary(candidate, dictionary)
     console.log("DICTIONARY CACHE SAVED:", candidate)
 
-    // headword が異なる場合は headword 側にも同じ内容を保存しておく（重複 Oxford call 防止）
-    if (headword !== candidate) {
-      const headwordAlreadyCached = await getCachedDictionary(headword)
-      if (!headwordAlreadyCached) {
-        await saveDictionary(headword, dictionary)
-        console.log("DICTIONARY CACHE SAVED (headword alias):", headword)
-      }
-    }
-
     return { resolved: candidate, dictionary }
   }
 
