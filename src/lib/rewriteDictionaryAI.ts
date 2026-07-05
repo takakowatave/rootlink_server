@@ -56,6 +56,7 @@ export type RewriteDictionaryAIResult = {
 // 英語 rewrite に渡す入力 1 件。
 type RewriteSourceItem = {
   id: string
+  headword: string
   sourceDefinition: string
 }
 
@@ -152,6 +153,7 @@ function buildRewriteSources(data: NormalizedDictionary): RewriteSourceItem[] {
 
       items.push({
         id: sense.senseId,
+        headword: data.word,
         sourceDefinition: sense.definition,
       })
     }
