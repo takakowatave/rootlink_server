@@ -7,7 +7,7 @@ const TTS_BUCKET = "word-audio"
  * 成功時は audioPath（例: "word-audio/agree.mp3"）を返す。
  * 失敗時は null を返す（辞書表示は落とさない）。
  */
-export async function generateTTS(word: string): Promise<string | null> {
+export async function generateTTS(word: string, ipa?: string): Promise<string | null> {
   const storagePath = `${word}.mp3`
   const audioPath = `${TTS_BUCKET}/${storagePath}`
 
@@ -18,6 +18,10 @@ export async function generateTTS(word: string): Promise<string | null> {
       return null
     }
 
+    const instructions = ipa
+      ? `Pronounce the single English word "${word}" in British English. IPA: /${ipa}/. Speak it as one word — do not split into parts.`
+      : `Speak the single English word "${word}" in a clear British English accent. Say it as one whole word.`
+
     const ttsRes = await fetch("https://api.openai.com/v1/audio/speech", {
       method: "POST",
       headers: {
@@ -27,8 +31,8 @@ export async function generateTTS(word: string): Promise<string | null> {
       body: JSON.stringify({
         model: "gpt-4o-mini-tts",
         input: word,
-        voice: "alloy",
-        instructions: "Speak in British English accent.",
+        voice: "shimmer",
+        instructions,
         response_format: "mp3",
       }),
     })

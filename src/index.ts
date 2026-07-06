@@ -91,13 +91,16 @@ app.post("/audio", async (c) => {
 
     const supabase = getSupabase()
 
-    // キャッシュ確認
+    // words + dictionary_cache を同時取得
     const { data: wordRow } = await supabase
       .from("words")
       .select("id")
       .eq("word", word)
       .maybeSingle()
 
+    type CachePayload = { ipa?: string; audio?: { audioPath: string }; [key: string]: unknown }
+    let cachedPayload: CachePayload | null = null
+
     if (wordRow?.id) {
       const { data: cached } = await supabase
         .from("dictionary_cache")
@@ -105,31 +108,25 @@ app.post("/audio", async (c) => {
         .eq("word_id", wordRow.id)
         .maybeSingle()
 
-      if (cached?.payload?.audio?.audioPath) {
+      cachedPayload = (cached?.payload as CachePayload) ?? null
+
+      if (cachedPayload?.audio?.audioPath) {
         const supabaseUrl = process.env.SUPABASE_URL!
-        const audioUrl = `${supabaseUrl}/storage/v1/object/public/${cached.payload.audio.audioPath}`
+        const audioUrl = `${supabaseUrl}/storage/v1/object/public/${cachedPayload.audio.audioPath}`
         return c.json({ ok: true, audioUrl })
       }
     }
 
-    // 生成
-    const audioPath = await generateTTS(word)
+    // 生成（IPA があれば渡して発音精度を上げる）
+    const audioPath = await generateTTS(word, cachedPayload?.ipa)
     if (!audioPath) return c.json({ ok: false, reason: "TTS_FAILED" }, 500)
 
     // payloadに保存
-    if (wordRow?.id) {
-      const { data: cached } = await supabase
+    if (wordRow?.id && cachedPayload) {
+      await supabase
         .from("dictionary_cache")
-        .select("payload")
+        .update({ payload: { ...cachedPayload, audio: { audioPath } } })
         .eq("word_id", wordRow.id)
-        .maybeSingle()
-
-      if (cached?.payload) {
-        await supabase
-          .from("dictionary_cache")
-          .update({ payload: { ...cached.payload, audio: { audioPath } } })
-          .eq("word_id", wordRow.id)
-      }
     }
 
     const supabaseUrl = process.env.SUPABASE_URL!
