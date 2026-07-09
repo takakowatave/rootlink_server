@@ -45,12 +45,19 @@ export type AIEtymologyTranslation = {
   hookJa: string | null
 }
 
+export type SupplementaryContent = {
+  collocations: string[]
+  usageNoteEn: string | null
+  usageNoteJa: string | null
+}
+
 // rewriteDictionary へ返す AI 結果。
 export type RewriteDictionaryAIResult = {
   rewrittenDefinitions: Map<string, string>
   translatedSenses: Map<string, AISenseTranslation>
   translatedEtymology: AIEtymologyTranslation
   generatedExamples: Map<string, string>
+  supplementary: SupplementaryContent | null
 }
 
 // 英語 rewrite に渡す入力 1 件。
@@ -297,6 +304,56 @@ function buildExampleGenerationPrompt(items: ExampleGenerationItem[]): string {
     "Input:",
     JSON.stringify(items),
   ].join("\n")
+}
+
+function buildSupplementaryPrompt(word: string, partOfSpeech: string, definitionEn: string): string {
+  return [
+    `Generate supplementary learning content for the English word "${word}" (${partOfSpeech}).`,
+    `Definition: ${definitionEn}`,
+    "",
+    "Produce:",
+    `1. collocations: 8-12 common English collocations. Each entry should be a natural phrase containing "${word}" (e.g. "ongoing negotiations", "ongoing research"). Only include real, widely-used combinations.`,
+    "2. usageNoteEn: 1-2 sentences about usage, grammar point, or common mistake to avoid. null if nothing notable.",
+    "3. usageNoteJa: Japanese translation of usageNoteEn for Japanese learners. null if usageNoteEn is null.",
+    "",
+    "Return JSON only.",
+    '{"collocations":["..."],"usageNoteEn":"..."|null,"usageNoteJa":"..."|null}',
+  ].join("\n")
+}
+
+async function generateSupplementaryContent(
+  word: string,
+  partOfSpeech: string,
+  definitionEn: string
+): Promise<SupplementaryContent | null> {
+  try {
+    const content = await postOpenAI([
+      {
+        role: "system",
+        content: "You generate supplementary vocabulary learning content (collocations and usage notes) for English learners. Return JSON only.",
+      },
+      {
+        role: "user",
+        content: buildSupplementaryPrompt(word, partOfSpeech, definitionEn),
+      },
+    ])
+
+    const parsed = safeJsonParse<{
+      collocations?: unknown
+      usageNoteEn?: unknown
+      usageNoteJa?: unknown
+    }>(content)
+
+    return {
+      collocations: Array.isArray(parsed.collocations)
+        ? parsed.collocations.filter((c): c is string => typeof c === "string")
+        : [],
+      usageNoteEn: typeof parsed.usageNoteEn === "string" ? parsed.usageNoteEn : null,
+      usageNoteJa: typeof parsed.usageNoteJa === "string" ? parsed.usageNoteJa : null,
+    }
+  } catch {
+    return null
+  }
 }
 
 // 語源説明文 / hook / sourceMeaning だけを日本語化する。
@@ -640,10 +697,24 @@ export async function rewriteDictionaryAI(
     hookEn: etymologyStructure?.hook ?? null,
   })
 
+  // エントリが薄い場合（全 sense 合計 3 以下）はコロケーション・使い方ノートを補完生成
+  const totalSenses = data.senseGroups.reduce((sum, g) => sum + g.senses.length, 0)
+  let supplementary: SupplementaryContent | null = null
+  if (totalSenses <= 3) {
+    const firstGroup = data.senseGroups[0]
+    const firstSense = firstGroup?.senses[0]
+    if (firstGroup && firstSense) {
+      const definitionEn =
+        rewrittenDefinitions.get(firstSense.senseId)?.trim() || firstSense.definition
+      supplementary = await generateSupplementaryContent(data.word, firstGroup.partOfSpeech, definitionEn)
+    }
+  }
+
   return {
     rewrittenDefinitions,
     translatedSenses,
     translatedEtymology,
     generatedExamples,
+    supplementary,
   }
 }

@@ -15,7 +15,7 @@
 
 import type { NormalizedDictionary } from "./normalizeDictionary.js"
 import type { EtymologyData } from "../types/etymology.js"
-import { rewriteDictionaryAI } from "./rewriteDictionaryAI.js"
+import { rewriteDictionaryAI, type SupplementaryContent } from "./rewriteDictionaryAI.js"
 import {
   buildJaLocalePayload,
   type LocalePayload,
@@ -58,6 +58,7 @@ export type RewrittenDictionary = {
   etymologyData: EtymologyData | null
   locales: Partial<Record<SupportedLocale, LocalePayload>>
   audio?: { audioPath: string }
+  supplementary?: SupplementaryContent
 }
 
 const SCHEMA_VERSION = 3
@@ -115,5 +116,6 @@ export async function rewriteDictionary(
     locales: {
       ja: jaLocale,
     },
+    ...(aiResult.supplementary ? { supplementary: aiResult.supplementary } : {}),
   }
 }
