@@ -7,6 +7,7 @@ import stripe from "./routes/stripe.js";
 import { resolveQuery } from "./lib/resolveQuery.js";
 import { getSupabase } from "./lib/supabase.js";
 import { generateTTS } from "./lib/generateTTS.js";
+import { rateLimit } from "./lib/rateLimit.js";
 
 const app = new Hono();
 
@@ -48,10 +49,14 @@ app.route("/stripe", stripe);
 /* =========================
  * 4. resolveQuery
  * ========================= */
-app.post("/resolve", async (c) => {
+app.post("/resolve", rateLimit, async (c) => {
   try {
     const body = await c.req.json()
-    const result = await resolveQuery(body.query)
+    const query = typeof body?.query === "string" ? body.query.trim() : ""
+    if (!query || query.length > 100) {
+      return c.json({ ok: false, reason: "INVALID_QUERY" }, 400)
+    }
+    const result = await resolveQuery(query)
     return c.json(result)
   } catch (error) {
     if (
