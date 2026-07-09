@@ -101,9 +101,12 @@ router.post("/portal", async (c) => {
       return c.json({ ok: false, reason: "NO_SUBSCRIPTION" }, 404)
     }
 
+    const locale = (body.locale as string) || "auto"
+
     const session = await stripe.billingPortal.sessions.create({
       customer: sub.stripe_customer_id,
       return_url: `${origin}/wordlist`,
+      locale: locale as "auto" | "ja" | "en",
     })
 
     return c.json({ ok: true, url: session.url })
