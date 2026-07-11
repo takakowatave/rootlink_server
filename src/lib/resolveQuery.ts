@@ -323,6 +323,38 @@ async function ensureWordId(word: string): Promise<string> {
   return data.id
 }
 
+/**
+ * dictionary_cache.payload.inflections から入力語を含むエントリーを探す。
+ * 米/英綴りの差異（anesthesia ↔ anaesthesia など）を吸収するための救済用。
+ */
+async function findByInflection(
+  input: string
+): Promise<{ headword: string; dictionary: RewrittenDictionary } | null> {
+  const supabase = getSupabase()
+
+  const { data, error } = await supabase
+    .from("dictionary_cache")
+    .select("payload, words(word)")
+    .filter("payload->inflections", "cs", JSON.stringify([input]))
+    .limit(1)
+    .maybeSingle()
+
+  if (error) {
+    console.error("INFLECTION LOOKUP FAILED:", error)
+    return null
+  }
+  if (!isRecord(data)) return null
+
+  const wordsRel = (data as { words?: unknown }).words
+  const headword = isRecord(wordsRel) ? readString(wordsRel.word) : ""
+  if (!headword) return null
+
+  const payload = (data as { payload?: unknown }).payload
+  if (!isRecord(payload)) return null
+
+  return { headword, dictionary: payload as RewrittenDictionary }
+}
+
 /** dictionary_cache から完成済み payload を読む。 */
 async function getCachedDictionary(
   word: string
@@ -651,6 +683,21 @@ async function resolveQueryInternal(raw: string): Promise<ResolveResult> {
         changed: direct.resolved !== input,
         redirectTo: `/word/${direct.resolved}`,
         dictionary: direct.dictionary,
+      }
+    }
+
+    // Oxford に該当がない場合、既存の dictionary_cache.inflections から
+    // 米/英綴りの差異を吸収する（例: anesthesia → anaesthesia）。
+    console.log("INFLECTION LOOKUP ATTEMPT:", input)
+    const byInflection = await findByInflection(input)
+    if (byInflection) {
+      console.log("INFLECTION HIT:", input, "->", byInflection.headword)
+      return {
+        ok: true,
+        resolved: byInflection.headword,
+        changed: byInflection.headword !== input,
+        redirectTo: `/word/${byInflection.headword}`,
+        dictionary: byInflection.dictionary,
       }
     }
 
