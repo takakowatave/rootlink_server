@@ -437,13 +437,34 @@ function needsSenseFallback(senseGroups: NormalizedSenseGroup[]): boolean {
   return !hasNeutralSense
 }
 
+/** Oxford entries から最初の lexicalCategory.id を取り出す */
+function extractPrimaryPos(entries: unknown): string | undefined {
+  try {
+    const results = (entries as { results?: unknown[] })?.results
+    if (!Array.isArray(results)) return undefined
+    for (const result of results) {
+      const lexicalEntries = (result as { lexicalEntries?: unknown[] })?.lexicalEntries
+      if (!Array.isArray(lexicalEntries)) continue
+      for (const le of lexicalEntries) {
+        const id = (le as { lexicalCategory?: { id?: string } })?.lexicalCategory?.id
+        if (id) return id.toLowerCase()
+      }
+    }
+    return undefined
+  } catch {
+    return undefined
+  }
+}
+
 /** Oxford から整形に必要な材料を集める。 */
 async function buildNormalizedDictionary(candidate: string, entries: unknown) {
   const supabase = getSupabase()
 
+  const primaryPos = extractPrimaryPos(entries)
+
   const [inflections, derivatives] = await Promise.all([
     fetchInflections(candidate),
-    generateDerivatives(candidate).catch((error: unknown) => {
+    generateDerivatives(candidate, primaryPos).catch((error: unknown) => {
       console.error("GENERATE DERIVATIVES FAILED:", error)
       return [] as string[]
     }),
