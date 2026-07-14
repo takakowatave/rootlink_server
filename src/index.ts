@@ -6,7 +6,7 @@ import auth from "./routes/auth.js";
 import stripe from "./routes/stripe.js";
 import { resolveQuery } from "./lib/resolveQuery.js";
 import { getSupabase } from "./lib/supabase.js";
-import { generateTTS } from "./lib/generateTTS.js";
+import { generateTTS, generatePhraseTTS } from "./lib/generateTTS.js";
 import { rateLimit } from "./lib/rateLimit.js";
 
 const app = new Hono();
@@ -139,6 +139,56 @@ app.post("/audio", async (c) => {
     return c.json({ ok: true, audioUrl })
   } catch (error) {
     console.error("AUDIO HANDLER FAILED:", error)
+    return c.json({ ok: false, reason: "INTERNAL_ERROR" }, 500)
+  }
+})
+
+/* =========================
+ * 5b. Audio for phrase example (TTS on demand)
+ * ========================= */
+app.post("/audio/phrase", async (c) => {
+  try {
+    const body = await c.req.json()
+    const phraseCardId: string = body.phrase_card_id
+
+    if (!phraseCardId) {
+      return c.json({ ok: false, reason: "MISSING_PHRASE_CARD_ID" }, 400)
+    }
+
+    const supabase = getSupabase()
+    const supabaseUrl = process.env.SUPABASE_URL!
+
+    const { data: card } = await supabase
+      .from("phrase_cards")
+      .select("id, example_en, audio_path")
+      .eq("id", phraseCardId)
+      .maybeSingle()
+
+    if (!card) {
+      return c.json({ ok: false, reason: "NOT_FOUND" }, 404)
+    }
+
+    if (card.audio_path) {
+      const audioUrl = `${supabaseUrl}/storage/v1/object/public/${card.audio_path}`
+      return c.json({ ok: true, audioUrl })
+    }
+
+    if (!card.example_en) {
+      return c.json({ ok: false, reason: "NO_EXAMPLE" }, 400)
+    }
+
+    const audioPath = await generatePhraseTTS(card.id, card.example_en)
+    if (!audioPath) return c.json({ ok: false, reason: "TTS_FAILED" }, 500)
+
+    await supabase
+      .from("phrase_cards")
+      .update({ audio_path: audioPath })
+      .eq("id", card.id)
+
+    const audioUrl = `${supabaseUrl}/storage/v1/object/public/${audioPath}`
+    return c.json({ ok: true, audioUrl })
+  } catch (error) {
+    console.error("AUDIO PHRASE HANDLER FAILED:", error)
     return c.json({ ok: false, reason: "INTERNAL_ERROR" }, 500)
   }
 })
