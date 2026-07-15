@@ -47,6 +47,28 @@ export async function generatePhraseTTS(
   })
 }
 
+/**
+ * phrase 見出し（タイトル）の mp3 を生成し phrase-audio bucket に保存する。
+ * ファイル名は `${phrase_card_id}_headword.mp3` 固定。
+ */
+export async function generatePhraseHeadwordTTS(
+  phraseCardId: string,
+  phraseText: string,
+): Promise<string | null> {
+  const storagePath = `${phraseCardId}_headword.mp3`
+  const audioPath = `${PHRASE_BUCKET}/${storagePath}`
+
+  const instructions = `Speak the following English phrase clearly in a British English accent. Say it as one natural chunk — not word by word.`
+
+  return runTTS({
+    input: phraseText,
+    instructions,
+    bucket: PHRASE_BUCKET,
+    storagePath,
+    audioPath,
+  })
+}
+
 type RunTTSArgs = {
   input: string
   instructions: string
