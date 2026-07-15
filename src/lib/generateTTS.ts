@@ -48,6 +48,28 @@ export async function generatePhraseTTS(
 }
 
 /**
+ * 単語の sense 例文の mp3 を生成し word-audio bucket に保存する。
+ * ファイル名は `example_${senseId}.mp3` 固定。
+ */
+export async function generateWordExampleTTS(
+  senseId: string,
+  exampleText: string,
+): Promise<string | null> {
+  const storagePath = `example_${senseId}.mp3`
+  const audioPath = `${WORD_BUCKET}/${storagePath}`
+
+  const instructions = `Read the following English sentence in a natural, clear British English accent. Speak it as a whole sentence with natural intonation and pacing — not word by word.`
+
+  return runTTS({
+    input: exampleText,
+    instructions,
+    bucket: WORD_BUCKET,
+    storagePath,
+    audioPath,
+  })
+}
+
+/**
  * phrase 見出し（タイトル）の mp3 を生成し phrase-audio bucket に保存する。
  * ファイル名は `${phrase_card_id}_headword.mp3` 固定。
  */

@@ -6,7 +6,7 @@ import auth from "./routes/auth.js";
 import stripe from "./routes/stripe.js";
 import { resolveQuery } from "./lib/resolveQuery.js";
 import { getSupabase } from "./lib/supabase.js";
-import { generateTTS, generatePhraseTTS, generatePhraseHeadwordTTS } from "./lib/generateTTS.js";
+import { generateTTS, generatePhraseTTS, generatePhraseHeadwordTTS, generateWordExampleTTS } from "./lib/generateTTS.js";
 import { rateLimit } from "./lib/rateLimit.js";
 
 const app = new Hono();
@@ -139,6 +139,93 @@ app.post("/audio", async (c) => {
     return c.json({ ok: true, audioUrl })
   } catch (error) {
     console.error("AUDIO HANDLER FAILED:", error)
+    return c.json({ ok: false, reason: "INTERNAL_ERROR" }, 500)
+  }
+})
+
+/* =========================
+ * 5a. Audio for word sense example (TTS on demand)
+ * ========================= */
+app.post("/audio/word/example", async (c) => {
+  try {
+    const body = await c.req.json()
+    const word: string = body.word
+    const senseId: string = body.sense_id
+
+    if (!word || !senseId) {
+      return c.json({ ok: false, reason: "MISSING_PARAMS" }, 400)
+    }
+
+    const supabase = getSupabase()
+    const supabaseUrl = process.env.SUPABASE_URL!
+
+    const { data: wordRow } = await supabase
+      .from("words")
+      .select("id")
+      .eq("word", word)
+      .maybeSingle()
+
+    if (!wordRow?.id) {
+      return c.json({ ok: false, reason: "WORD_NOT_FOUND" }, 404)
+    }
+
+    const { data: cached } = await supabase
+      .from("dictionary_cache")
+      .select("payload")
+      .eq("word_id", wordRow.id)
+      .maybeSingle()
+
+    type SenseAudioMap = Record<string, string>
+    type Sense = { senseId?: string; example?: string }
+    type SenseGroup = { senses?: Sense[] }
+    type CachePayload = {
+      senseGroups?: SenseGroup[]
+      senseAudioPaths?: SenseAudioMap
+      [key: string]: unknown
+    }
+
+    const payload = (cached?.payload as CachePayload | null) ?? null
+    if (!payload) {
+      return c.json({ ok: false, reason: "CACHE_NOT_FOUND" }, 404)
+    }
+
+    const cachedPath = payload.senseAudioPaths?.[senseId]
+    if (cachedPath) {
+      const audioUrl = `${supabaseUrl}/storage/v1/object/public/${cachedPath}`
+      return c.json({ ok: true, audioUrl })
+    }
+
+    let exampleText: string | undefined
+    for (const group of payload.senseGroups ?? []) {
+      for (const sense of group.senses ?? []) {
+        if (sense.senseId === senseId && sense.example) {
+          exampleText = sense.example
+          break
+        }
+      }
+      if (exampleText) break
+    }
+
+    if (!exampleText) {
+      return c.json({ ok: false, reason: "NO_EXAMPLE" }, 400)
+    }
+
+    const audioPath = await generateWordExampleTTS(senseId, exampleText)
+    if (!audioPath) return c.json({ ok: false, reason: "TTS_FAILED" }, 500)
+
+    const nextAudioMap: SenseAudioMap = {
+      ...(payload.senseAudioPaths ?? {}),
+      [senseId]: audioPath,
+    }
+    await supabase
+      .from("dictionary_cache")
+      .update({ payload: { ...payload, senseAudioPaths: nextAudioMap } })
+      .eq("word_id", wordRow.id)
+
+    const audioUrl = `${supabaseUrl}/storage/v1/object/public/${audioPath}`
+    return c.json({ ok: true, audioUrl })
+  } catch (error) {
+    console.error("AUDIO WORD EXAMPLE HANDLER FAILED:", error)
     return c.json({ ok: false, reason: "INTERNAL_ERROR" }, 500)
   }
 })
