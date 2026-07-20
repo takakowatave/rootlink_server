@@ -6,7 +6,8 @@ import auth from "./routes/auth.js";
 import stripe from "./routes/stripe.js";
 import { resolveQuery } from "./lib/resolveQuery.js";
 import { getSupabase } from "./lib/supabase.js";
-import { generateTTS, generatePhraseTTS, generatePhraseHeadwordTTS, generateWordExampleTTS } from "./lib/generateTTS.js";
+import { generateTTS, generateTTSInstructions, generatePhraseTTS, generatePhraseHeadwordTTS, generateWordExampleTTS } from "./lib/generateTTS.js";
+import { fetchOxfordAudioUrl } from "./lib/fetchOxfordAudio.js";
 import { rateLimit } from "./lib/rateLimit.js";
 
 const app = new Hono();
@@ -103,7 +104,12 @@ app.post("/audio", async (c) => {
       .eq("word", word)
       .maybeSingle()
 
-    type CachePayload = { ipa?: string; audio?: { audioPath: string }; [key: string]: unknown }
+    type CachePayload = {
+      ipa?: string
+      audio?: { audioUrl?: string; audioPath?: string }
+      ttsInstructions?: string
+      [key: string]: unknown
+    }
     let cachedPayload: CachePayload | null = null
 
     if (wordRow?.id) {
@@ -115,22 +121,46 @@ app.post("/audio", async (c) => {
 
       cachedPayload = (cached?.payload as CachePayload) ?? null
 
+      // Oxford の公式音声 URL が最優先
+      if (cachedPayload?.audio?.audioUrl) {
+        return c.json({ ok: true, audioUrl: cachedPayload.audio.audioUrl })
+      }
+
       if (cachedPayload?.audio?.audioPath) {
         const supabaseUrl = process.env.SUPABASE_URL!
         const audioUrl = `${supabaseUrl}/storage/v1/object/public/${cachedPayload.audio.audioPath}`
         return c.json({ ok: true, audioUrl })
       }
+
+      // Lazy backfill: 既存 cache に audio が入っていなくても、Oxford URL を1回取りに行って保存する。
+      // 実際に音声が鳴らされる単語だけがコスト対象になる（節約）。
+      const backfilledUrl = await fetchOxfordAudioUrl(word)
+      if (backfilledUrl) {
+        const nextPayload: CachePayload = { ...cachedPayload, audio: { audioUrl: backfilledUrl } }
+        await supabase
+          .from("dictionary_cache")
+          .update({ payload: nextPayload })
+          .eq("word_id", wordRow.id)
+        return c.json({ ok: true, audioUrl: backfilledUrl })
+      }
     }
 
-    // 生成（IPA があれば渡して発音精度を上げる）
-    const audioPath = await generateTTS(word, cachedPayload?.ipa)
+    // 発音 instructions を用意（キャッシュ優先・なければ IPA から生成）
+    let instructions = cachedPayload?.ttsInstructions
+    if (!instructions && cachedPayload?.ipa) {
+      instructions = await generateTTSInstructions(word, cachedPayload.ipa)
+    }
+
+    const audioPath = await generateTTS(word, instructions)
     if (!audioPath) return c.json({ ok: false, reason: "TTS_FAILED" }, 500)
 
-    // payloadに保存
+    // payloadに保存（audio + ttsInstructions を同時に）
     if (wordRow?.id && cachedPayload) {
+      const nextPayload: CachePayload = { ...cachedPayload, audio: { audioPath } }
+      if (instructions) nextPayload.ttsInstructions = instructions
       await supabase
         .from("dictionary_cache")
-        .update({ payload: { ...cachedPayload, audio: { audioPath } } })
+        .update({ payload: nextPayload })
         .eq("word_id", wordRow.id)
     }
 

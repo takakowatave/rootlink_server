@@ -54,6 +54,7 @@ export type NormalizedLexicalUnit = {
 export type NormalizedDictionary = {
   word: string
   ipa: string | null
+  audioUrl: string | null
   inflections: string[]
   senseGroups: NormalizedSenseGroup[]
   lexicalUnits: NormalizedLexicalUnit[]
@@ -91,6 +92,7 @@ type OxfordTextValue = {
 
 type OxfordPronunciation = {
   phoneticSpelling?: string
+  audioFile?: string
 }
 
 type OxfordNote = {
@@ -214,9 +216,13 @@ function readPronunciation(value: unknown): OxfordPronunciation | null {
   if (!isRecord(value)) return null
 
   const phoneticSpelling = readString(value.phoneticSpelling)
-  if (!phoneticSpelling) return null
+  const audioFile = readString(value.audioFile)
+  if (!phoneticSpelling && !audioFile) return null
 
-  return { phoneticSpelling }
+  return {
+    phoneticSpelling: phoneticSpelling || undefined,
+    audioFile: audioFile || undefined,
+  }
 }
 
 /**
@@ -477,6 +483,27 @@ function extractIPA(lexicalEntries: OxfordLexicalEntry[]): string | null {
     .flatMap((lexicalEntry) => getEntries(lexicalEntry))
     .flatMap((entry) => entry.pronunciations ?? [])
     .map((pronunciation) => pronunciation.phoneticSpelling ?? "")
+    .find((value) => value.length > 0)
+
+  return fromEntry ?? null
+}
+
+/**
+ * audioFile URL を抽出する。
+ * lexicalEntry 側を先に見て、なければ entry 側を見る。
+ */
+function extractAudioUrl(lexicalEntries: OxfordLexicalEntry[]): string | null {
+  const fromLexicalEntry = lexicalEntries
+    .flatMap((lexicalEntry) => lexicalEntry.pronunciations ?? [])
+    .map((pronunciation) => pronunciation.audioFile ?? "")
+    .find((value) => value.length > 0)
+
+  if (fromLexicalEntry) return fromLexicalEntry
+
+  const fromEntry = lexicalEntries
+    .flatMap((lexicalEntry) => getEntries(lexicalEntry))
+    .flatMap((entry) => entry.pronunciations ?? [])
+    .map((pronunciation) => pronunciation.audioFile ?? "")
     .find((value) => value.length > 0)
 
   return fromEntry ?? null
@@ -898,6 +925,7 @@ export async function normalizeDictionary(
   return {
     word,
     ipa: extractIPA(lexicalEntries),
+    audioUrl: extractAudioUrl(lexicalEntries),
     inflections: normalizedInflections,
     senseGroups: extractSenseGroups(lexicalEntries, word),
     lexicalUnits: normalizedLexicalUnits,
