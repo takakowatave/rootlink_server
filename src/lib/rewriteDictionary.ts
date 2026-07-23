@@ -57,7 +57,7 @@ export type RewrittenDictionary = {
   etymology: string | null
   etymologyData: EtymologyData | null
   locales: Partial<Record<SupportedLocale, LocalePayload>>
-  audio?: { audioPath: string }
+  audio?: { audioUrl?: string; audioPath?: string }
 }
 
 const SCHEMA_VERSION = 3
@@ -115,5 +115,6 @@ export async function rewriteDictionary(
     locales: {
       ja: jaLocale,
     },
+    ...(data.audioUrl ? { audio: { audioUrl: data.audioUrl } } : {}),
   }
 }

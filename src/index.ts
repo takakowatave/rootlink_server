@@ -6,7 +6,8 @@ import auth from "./routes/auth.js";
 import stripe from "./routes/stripe.js";
 import { resolveQuery } from "./lib/resolveQuery.js";
 import { getSupabase } from "./lib/supabase.js";
-import { generateTTS } from "./lib/generateTTS.js";
+import { generateTTS, generateTTSInstructions, generatePhraseTTS, generatePhraseHeadwordTTS, generateWordExampleTTS } from "./lib/generateTTS.js";
+import { fetchOxfordAudioUrl } from "./lib/fetchOxfordAudio.js";
 import { rateLimit } from "./lib/rateLimit.js";
 
 const app = new Hono();
@@ -103,7 +104,12 @@ app.post("/audio", async (c) => {
       .eq("word", word)
       .maybeSingle()
 
-    type CachePayload = { ipa?: string; audio?: { audioPath: string }; [key: string]: unknown }
+    type CachePayload = {
+      ipa?: string
+      audio?: { audioUrl?: string; audioPath?: string }
+      ttsInstructions?: string
+      [key: string]: unknown
+    }
     let cachedPayload: CachePayload | null = null
 
     if (wordRow?.id) {
@@ -115,22 +121,46 @@ app.post("/audio", async (c) => {
 
       cachedPayload = (cached?.payload as CachePayload) ?? null
 
+      // Oxford の公式音声 URL が最優先
+      if (cachedPayload?.audio?.audioUrl) {
+        return c.json({ ok: true, audioUrl: cachedPayload.audio.audioUrl })
+      }
+
       if (cachedPayload?.audio?.audioPath) {
         const supabaseUrl = process.env.SUPABASE_URL!
         const audioUrl = `${supabaseUrl}/storage/v1/object/public/${cachedPayload.audio.audioPath}`
         return c.json({ ok: true, audioUrl })
       }
+
+      // Lazy backfill: 既存 cache に audio が入っていなくても、Oxford URL を1回取りに行って保存する。
+      // 実際に音声が鳴らされる単語だけがコスト対象になる（節約）。
+      const backfilledUrl = await fetchOxfordAudioUrl(word)
+      if (backfilledUrl) {
+        const nextPayload: CachePayload = { ...cachedPayload, audio: { audioUrl: backfilledUrl } }
+        await supabase
+          .from("dictionary_cache")
+          .update({ payload: nextPayload })
+          .eq("word_id", wordRow.id)
+        return c.json({ ok: true, audioUrl: backfilledUrl })
+      }
     }
 
-    // 生成（IPA があれば渡して発音精度を上げる）
-    const audioPath = await generateTTS(word, cachedPayload?.ipa)
+    // 発音 instructions を用意（キャッシュ優先・なければ IPA から生成）
+    let instructions = cachedPayload?.ttsInstructions
+    if (!instructions && cachedPayload?.ipa) {
+      instructions = await generateTTSInstructions(word, cachedPayload.ipa)
+    }
+
+    const audioPath = await generateTTS(word, instructions)
     if (!audioPath) return c.json({ ok: false, reason: "TTS_FAILED" }, 500)
 
-    // payloadに保存
+    // payloadに保存（audio + ttsInstructions を同時に）
     if (wordRow?.id && cachedPayload) {
+      const nextPayload: CachePayload = { ...cachedPayload, audio: { audioPath } }
+      if (instructions) nextPayload.ttsInstructions = instructions
       await supabase
         .from("dictionary_cache")
-        .update({ payload: { ...cachedPayload, audio: { audioPath } } })
+        .update({ payload: nextPayload })
         .eq("word_id", wordRow.id)
     }
 
@@ -139,6 +169,193 @@ app.post("/audio", async (c) => {
     return c.json({ ok: true, audioUrl })
   } catch (error) {
     console.error("AUDIO HANDLER FAILED:", error)
+    return c.json({ ok: false, reason: "INTERNAL_ERROR" }, 500)
+  }
+})
+
+/* =========================
+ * 5a. Audio for word sense example (TTS on demand)
+ * ========================= */
+app.post("/audio/word/example", async (c) => {
+  try {
+    const body = await c.req.json()
+    const word: string = body.word
+    const senseId: string = body.sense_id
+
+    if (!word || !senseId) {
+      return c.json({ ok: false, reason: "MISSING_PARAMS" }, 400)
+    }
+
+    const supabase = getSupabase()
+    const supabaseUrl = process.env.SUPABASE_URL!
+
+    const { data: wordRow } = await supabase
+      .from("words")
+      .select("id")
+      .eq("word", word)
+      .maybeSingle()
+
+    if (!wordRow?.id) {
+      return c.json({ ok: false, reason: "WORD_NOT_FOUND" }, 404)
+    }
+
+    const { data: cached } = await supabase
+      .from("dictionary_cache")
+      .select("payload")
+      .eq("word_id", wordRow.id)
+      .maybeSingle()
+
+    type SenseAudioMap = Record<string, string>
+    type Sense = { senseId?: string; example?: string }
+    type SenseGroup = { senses?: Sense[] }
+    type CachePayload = {
+      senseGroups?: SenseGroup[]
+      senseAudioPaths?: SenseAudioMap
+      [key: string]: unknown
+    }
+
+    const payload = (cached?.payload as CachePayload | null) ?? null
+    if (!payload) {
+      return c.json({ ok: false, reason: "CACHE_NOT_FOUND" }, 404)
+    }
+
+    const cachedPath = payload.senseAudioPaths?.[senseId]
+    if (cachedPath) {
+      const audioUrl = `${supabaseUrl}/storage/v1/object/public/${cachedPath}`
+      return c.json({ ok: true, audioUrl })
+    }
+
+    let exampleText: string | undefined
+    for (const group of payload.senseGroups ?? []) {
+      for (const sense of group.senses ?? []) {
+        if (sense.senseId === senseId && sense.example) {
+          exampleText = sense.example
+          break
+        }
+      }
+      if (exampleText) break
+    }
+
+    if (!exampleText) {
+      return c.json({ ok: false, reason: "NO_EXAMPLE" }, 400)
+    }
+
+    const audioPath = await generateWordExampleTTS(senseId, exampleText)
+    if (!audioPath) return c.json({ ok: false, reason: "TTS_FAILED" }, 500)
+
+    const nextAudioMap: SenseAudioMap = {
+      ...(payload.senseAudioPaths ?? {}),
+      [senseId]: audioPath,
+    }
+    await supabase
+      .from("dictionary_cache")
+      .update({ payload: { ...payload, senseAudioPaths: nextAudioMap } })
+      .eq("word_id", wordRow.id)
+
+    const audioUrl = `${supabaseUrl}/storage/v1/object/public/${audioPath}`
+    return c.json({ ok: true, audioUrl })
+  } catch (error) {
+    console.error("AUDIO WORD EXAMPLE HANDLER FAILED:", error)
+    return c.json({ ok: false, reason: "INTERNAL_ERROR" }, 500)
+  }
+})
+
+/* =========================
+ * 5b. Audio for phrase example (TTS on demand)
+ * ========================= */
+app.post("/audio/phrase", async (c) => {
+  try {
+    const body = await c.req.json()
+    const phraseCardId: string = body.phrase_card_id
+
+    if (!phraseCardId) {
+      return c.json({ ok: false, reason: "MISSING_PHRASE_CARD_ID" }, 400)
+    }
+
+    const supabase = getSupabase()
+    const supabaseUrl = process.env.SUPABASE_URL!
+
+    const { data: card } = await supabase
+      .from("phrase_cards")
+      .select("id, example_en, audio_path")
+      .eq("id", phraseCardId)
+      .maybeSingle()
+
+    if (!card) {
+      return c.json({ ok: false, reason: "NOT_FOUND" }, 404)
+    }
+
+    if (card.audio_path) {
+      const audioUrl = `${supabaseUrl}/storage/v1/object/public/${card.audio_path}`
+      return c.json({ ok: true, audioUrl })
+    }
+
+    if (!card.example_en) {
+      return c.json({ ok: false, reason: "NO_EXAMPLE" }, 400)
+    }
+
+    const audioPath = await generatePhraseTTS(card.id, card.example_en)
+    if (!audioPath) return c.json({ ok: false, reason: "TTS_FAILED" }, 500)
+
+    await supabase
+      .from("phrase_cards")
+      .update({ audio_path: audioPath })
+      .eq("id", card.id)
+
+    const audioUrl = `${supabaseUrl}/storage/v1/object/public/${audioPath}`
+    return c.json({ ok: true, audioUrl })
+  } catch (error) {
+    console.error("AUDIO PHRASE HANDLER FAILED:", error)
+    return c.json({ ok: false, reason: "INTERNAL_ERROR" }, 500)
+  }
+})
+
+/* =========================
+ * 5c. Audio for phrase headword (TTS on demand)
+ * ========================= */
+app.post("/audio/phrase/headword", async (c) => {
+  try {
+    const body = await c.req.json()
+    const phraseCardId: string = body.phrase_card_id
+
+    if (!phraseCardId) {
+      return c.json({ ok: false, reason: "MISSING_PHRASE_CARD_ID" }, 400)
+    }
+
+    const supabase = getSupabase()
+    const supabaseUrl = process.env.SUPABASE_URL!
+
+    const { data: card } = await supabase
+      .from("phrase_cards")
+      .select("id, phrase, headword_audio_path")
+      .eq("id", phraseCardId)
+      .maybeSingle()
+
+    if (!card) {
+      return c.json({ ok: false, reason: "NOT_FOUND" }, 404)
+    }
+
+    if (card.headword_audio_path) {
+      const audioUrl = `${supabaseUrl}/storage/v1/object/public/${card.headword_audio_path}`
+      return c.json({ ok: true, audioUrl })
+    }
+
+    if (!card.phrase) {
+      return c.json({ ok: false, reason: "NO_PHRASE" }, 400)
+    }
+
+    const audioPath = await generatePhraseHeadwordTTS(card.id, card.phrase)
+    if (!audioPath) return c.json({ ok: false, reason: "TTS_FAILED" }, 500)
+
+    await supabase
+      .from("phrase_cards")
+      .update({ headword_audio_path: audioPath })
+      .eq("id", card.id)
+
+    const audioUrl = `${supabaseUrl}/storage/v1/object/public/${audioPath}`
+    return c.json({ ok: true, audioUrl })
+  } catch (error) {
+    console.error("AUDIO PHRASE HEADWORD HANDLER FAILED:", error)
     return c.json({ ok: false, reason: "INTERNAL_ERROR" }, 500)
   }
 })
