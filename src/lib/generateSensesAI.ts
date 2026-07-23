@@ -132,6 +132,7 @@ function buildPrompt(word: string, etymologyHint: string | null): string {
     "- For slang, only include meanings that are widely known (e.g. GOAT = Greatest Of All Time).",
     "- Keep definitions concise and learner-friendly.",
     "- Provide a short natural example sentence for each sense.",
+    "- Use British English for all definitions and example sentences.",
     "",
   ]
 
@@ -177,7 +178,7 @@ export async function generateSensesAI(input: {
       {
         role: "system",
         content:
-          "You generate factual English dictionary sense data. Only include universally recognized meanings. Do not invent. Return JSON only.",
+          "You generate factual English dictionary sense data. Only include universally recognized meanings. Do not invent. Use British English for all definitions and examples. Return JSON only.",
       },
       {
         role: "user",
