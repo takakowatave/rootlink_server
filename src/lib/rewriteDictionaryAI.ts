@@ -13,6 +13,7 @@
  */
 
 import type { NormalizedDictionary } from "./normalizeDictionary.js"
+import type { RewrittenDictionary } from "./rewriteDictionary.js"
 
 // AI が返す日本語 sense データ。
 export type AISenseTranslation = {
@@ -703,4 +704,118 @@ export async function rewriteDictionaryAI(
     translatedEtymology,
     generatedExamples,
   }
+}
+
+// キャッシュ済み辞書のうち example が null の sense だけ英例文＋和訳を再生成する。
+// Oxford は叩かない。定義済みの definition を prompt に渡して例文を作らせる。
+// 生成に失敗した sense は null のまま残す。
+export async function regenerateMissingExamples(
+  headword: string,
+  dictionary: RewrittenDictionary
+): Promise<{ dictionary: RewrittenDictionary; regenerated: number }> {
+  const missing: ExampleGenerationItem[] = []
+
+  for (const group of dictionary.senseGroups) {
+    for (const sense of group.senses) {
+      if (sense.example && sense.example.trim().length > 0) continue
+      const definitionEn = readString(sense.definition)
+      if (!definitionEn) continue
+      missing.push({
+        id: sense.senseId,
+        headword,
+        partOfSpeech: group.partOfSpeech,
+        definitionEn,
+      })
+    }
+  }
+
+  if (missing.length === 0) {
+    return { dictionary, regenerated: 0 }
+  }
+
+  console.log("REGENERATE MISSING EXAMPLES:", headword, missing.length, "senses")
+
+  // 英例文を再生成（headword 含有チェック＋1回リトライあり）
+  const generatedExamples = new Map<string, string>()
+  for (const groupItems of chunk(missing, CHUNK_SIZE)) {
+    const generated = await generateExamplesChunk(groupItems)
+    for (const [id, example] of generated) {
+      generatedExamples.set(id, example)
+    }
+  }
+
+  if (generatedExamples.size === 0) {
+    console.warn("REGENERATE MISSING EXAMPLES GAVE UP ALL:", headword)
+    return { dictionary, regenerated: 0 }
+  }
+
+  // 生成できた英例文だけ日本語訳を作る
+  const translationSources: TranslationSourceItem[] = []
+  for (const item of missing) {
+    const exampleEn = generatedExamples.get(item.id)
+    if (!exampleEn) continue
+    translationSources.push({
+      id: item.id,
+      partOfSpeech: item.partOfSpeech,
+      headword,
+      definitionEn: item.definitionEn,
+      exampleEn,
+    })
+  }
+
+  const translatedExamples = new Map<string, string | null>()
+  for (const groupItems of chunk(translationSources, CHUNK_SIZE)) {
+    try {
+      const translated = await translateChunk(groupItems)
+      for (const item of translated) {
+        if (!item.id) continue
+        translatedExamples.set(item.id, item.exampleJa ?? null)
+      }
+    } catch (error) {
+      console.error("REGENERATE TRANSLATE FAILED:", headword, error)
+    }
+  }
+
+  // dictionary を更新して返す（イミュータブルに新オブジェクトを作る）
+  const jaLocale = dictionary.locales?.ja
+  const updatedJaSenses = jaLocale ? { ...jaLocale.senses } : undefined
+
+  const updatedSenseGroups = dictionary.senseGroups.map((group) => ({
+    ...group,
+    senses: group.senses.map((sense) => {
+      const example = generatedExamples.get(sense.senseId)
+      if (!example) return sense
+
+      if (updatedJaSenses) {
+        const currentJa = updatedJaSenses[sense.senseId]
+        if (currentJa) {
+          updatedJaSenses[sense.senseId] = {
+            ...currentJa,
+            exampleTranslation: translatedExamples.get(sense.senseId) ?? null,
+          }
+        }
+      }
+
+      return { ...sense, example }
+    }),
+  }))
+
+  const updatedDictionary: RewrittenDictionary = {
+    ...dictionary,
+    senseGroups: updatedSenseGroups,
+    locales:
+      jaLocale && updatedJaSenses
+        ? { ...dictionary.locales, ja: { ...jaLocale, senses: updatedJaSenses } }
+        : dictionary.locales,
+  }
+
+  console.log(
+    "REGENERATE MISSING EXAMPLES DONE:",
+    headword,
+    generatedExamples.size,
+    "of",
+    missing.length
+  )
+
+  return { dictionary: updatedDictionary, regenerated: generatedExamples.size }
 }
