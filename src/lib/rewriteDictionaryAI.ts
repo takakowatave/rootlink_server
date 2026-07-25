@@ -288,8 +288,8 @@ function buildExampleGenerationPrompt(items: ExampleGenerationItem[]): string {
     "Generate a single natural British English example sentence for each dictionary sense.",
     "Rules:",
     "- The sentence must clearly illustrate the given definition.",
+    "- **The sentence MUST contain the headword itself** (inflected forms like plural/past tense/-ing are acceptable, e.g. 'run'→'ran'/'running', 'child'→'children'). Do NOT paraphrase it away with pronouns or synonyms.",
     "- Use everyday vocabulary. Keep sentences short (under 15 words).",
-    "- Do NOT use the headword itself in the sentence — use a pronoun or synonym.",
     "- Return JSON only.",
     "",
     'Output format: {"items":[{"id":"...","example":"..."}]}',
@@ -499,14 +499,30 @@ async function translateChunk(
   return normaliseTranslationItems(parsed.items)
 }
 
-async function generateExamplesChunk(
+// 例文に見出し語が含まれているかチェック。活用形も許すため語幹6文字までの前方一致で判定する。
+// 例: "wildfire" → "wildfir" が含まれていればOK。"run" → "run"（短い語はそのまま）
+function exampleContainsHeadword(example: string, headword: string): boolean {
+  const ex = example.toLowerCase()
+  const hw = headword.toLowerCase().trim()
+  if (!hw) return true
+  // 短い語 (3文字以下) は完全一致 or 前方一致で許容 (run→runs/running/ran はどれも "r" 始まりだが暴発防止で word-boundary)
+  if (hw.length <= 3) {
+    return new RegExp(`\\b${hw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[a-z]{0,3}\\b`, "i").test(example)
+  }
+  // 長い語は語幹 (先頭 length-2 文字、最低4文字) を substring 検索して活用形を許容
+  const stemLen = Math.max(4, hw.length - 2)
+  const stem = hw.slice(0, stemLen)
+  return ex.includes(stem)
+}
+
+async function callExampleGeneration(
   items: ExampleGenerationItem[]
 ): Promise<Map<string, string>> {
   const content = await postOpenAI([
     {
       role: "system",
       content:
-        "You generate natural British English example sentences for dictionary senses. Return JSON only.",
+        "You generate natural British English example sentences for dictionary senses. The example MUST contain the headword itself (inflected forms allowed). Return JSON only.",
     },
     {
       role: "user",
@@ -523,6 +539,47 @@ async function generateExamplesChunk(
     const id = readString(item.id)
     const example = readString(item.example)
     if (id && example) result.set(id, example)
+  }
+
+  return result
+}
+
+async function generateExamplesChunk(
+  items: ExampleGenerationItem[]
+): Promise<Map<string, string>> {
+  const generated = await callExampleGeneration(items)
+  const result = new Map<string, string>()
+  const needsRetry: ExampleGenerationItem[] = []
+
+  for (const item of items) {
+    const example = generated.get(item.id)
+    if (!example) continue
+    if (exampleContainsHeadword(example, item.headword)) {
+      result.set(item.id, example)
+    } else {
+      needsRetry.push(item)
+    }
+  }
+
+  if (needsRetry.length > 0) {
+    console.warn(
+      "EXAMPLE_GENERATION_MISSING_HEADWORD:",
+      needsRetry.map((i) => `${i.headword}(${i.id})`).join(", "),
+      "→ retrying"
+    )
+    const retried = await callExampleGeneration(needsRetry)
+    for (const item of needsRetry) {
+      const example = retried.get(item.id)
+      if (example && exampleContainsHeadword(example, item.headword)) {
+        result.set(item.id, example)
+      } else {
+        console.error(
+          "EXAMPLE_GENERATION_GAVE_UP:",
+          `${item.headword}(${item.id})`,
+          example ? `example="${example}"` : "no example returned"
+        )
+      }
+    }
   }
 
   return result
