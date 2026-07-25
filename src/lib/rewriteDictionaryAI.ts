@@ -13,6 +13,7 @@
  */
 
 import type { NormalizedDictionary } from "./normalizeDictionary.js"
+import type { RewrittenDictionary } from "./rewriteDictionary.js"
 
 // AI が返す日本語 sense データ。
 export type AISenseTranslation = {
@@ -288,8 +289,8 @@ function buildExampleGenerationPrompt(items: ExampleGenerationItem[]): string {
     "Generate a single natural British English example sentence for each dictionary sense.",
     "Rules:",
     "- The sentence must clearly illustrate the given definition.",
+    "- **The sentence MUST contain the headword itself** (inflected forms like plural/past tense/-ing are acceptable, e.g. 'run'→'ran'/'running', 'child'→'children'). Do NOT paraphrase it away with pronouns or synonyms.",
     "- Use everyday vocabulary. Keep sentences short (under 15 words).",
-    "- Do NOT use the headword itself in the sentence — use a pronoun or synonym.",
     "- Return JSON only.",
     "",
     'Output format: {"items":[{"id":"...","example":"..."}]}',
@@ -499,14 +500,30 @@ async function translateChunk(
   return normaliseTranslationItems(parsed.items)
 }
 
-async function generateExamplesChunk(
+// 例文に見出し語が含まれているかチェック。活用形も許すため語幹6文字までの前方一致で判定する。
+// 例: "wildfire" → "wildfir" が含まれていればOK。"run" → "run"（短い語はそのまま）
+function exampleContainsHeadword(example: string, headword: string): boolean {
+  const ex = example.toLowerCase()
+  const hw = headword.toLowerCase().trim()
+  if (!hw) return true
+  // 短い語 (3文字以下) は完全一致 or 前方一致で許容 (run→runs/running/ran はどれも "r" 始まりだが暴発防止で word-boundary)
+  if (hw.length <= 3) {
+    return new RegExp(`\\b${hw.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}[a-z]{0,3}\\b`, "i").test(example)
+  }
+  // 長い語は語幹 (先頭 length-2 文字、最低4文字) を substring 検索して活用形を許容
+  const stemLen = Math.max(4, hw.length - 2)
+  const stem = hw.slice(0, stemLen)
+  return ex.includes(stem)
+}
+
+async function callExampleGeneration(
   items: ExampleGenerationItem[]
 ): Promise<Map<string, string>> {
   const content = await postOpenAI([
     {
       role: "system",
       content:
-        "You generate natural British English example sentences for dictionary senses. Return JSON only.",
+        "You generate natural British English example sentences for dictionary senses. The example MUST contain the headword itself (inflected forms allowed). Return JSON only.",
     },
     {
       role: "user",
@@ -523,6 +540,47 @@ async function generateExamplesChunk(
     const id = readString(item.id)
     const example = readString(item.example)
     if (id && example) result.set(id, example)
+  }
+
+  return result
+}
+
+async function generateExamplesChunk(
+  items: ExampleGenerationItem[]
+): Promise<Map<string, string>> {
+  const generated = await callExampleGeneration(items)
+  const result = new Map<string, string>()
+  const needsRetry: ExampleGenerationItem[] = []
+
+  for (const item of items) {
+    const example = generated.get(item.id)
+    if (!example) continue
+    if (exampleContainsHeadword(example, item.headword)) {
+      result.set(item.id, example)
+    } else {
+      needsRetry.push(item)
+    }
+  }
+
+  if (needsRetry.length > 0) {
+    console.warn(
+      "EXAMPLE_GENERATION_MISSING_HEADWORD:",
+      needsRetry.map((i) => `${i.headword}(${i.id})`).join(", "),
+      "→ retrying"
+    )
+    const retried = await callExampleGeneration(needsRetry)
+    for (const item of needsRetry) {
+      const example = retried.get(item.id)
+      if (example && exampleContainsHeadword(example, item.headword)) {
+        result.set(item.id, example)
+      } else {
+        console.error(
+          "EXAMPLE_GENERATION_GAVE_UP:",
+          `${item.headword}(${item.id})`,
+          example ? `example="${example}"` : "no example returned"
+        )
+      }
+    }
   }
 
   return result
@@ -646,4 +704,118 @@ export async function rewriteDictionaryAI(
     translatedEtymology,
     generatedExamples,
   }
+}
+
+// キャッシュ済み辞書のうち example が null の sense だけ英例文＋和訳を再生成する。
+// Oxford は叩かない。定義済みの definition を prompt に渡して例文を作らせる。
+// 生成に失敗した sense は null のまま残す。
+export async function regenerateMissingExamples(
+  headword: string,
+  dictionary: RewrittenDictionary
+): Promise<{ dictionary: RewrittenDictionary; regenerated: number }> {
+  const missing: ExampleGenerationItem[] = []
+
+  for (const group of dictionary.senseGroups) {
+    for (const sense of group.senses) {
+      if (sense.example && sense.example.trim().length > 0) continue
+      const definitionEn = readString(sense.definition)
+      if (!definitionEn) continue
+      missing.push({
+        id: sense.senseId,
+        headword,
+        partOfSpeech: group.partOfSpeech,
+        definitionEn,
+      })
+    }
+  }
+
+  if (missing.length === 0) {
+    return { dictionary, regenerated: 0 }
+  }
+
+  console.log("REGENERATE MISSING EXAMPLES:", headword, missing.length, "senses")
+
+  // 英例文を再生成（headword 含有チェック＋1回リトライあり）
+  const generatedExamples = new Map<string, string>()
+  for (const groupItems of chunk(missing, CHUNK_SIZE)) {
+    const generated = await generateExamplesChunk(groupItems)
+    for (const [id, example] of generated) {
+      generatedExamples.set(id, example)
+    }
+  }
+
+  if (generatedExamples.size === 0) {
+    console.warn("REGENERATE MISSING EXAMPLES GAVE UP ALL:", headword)
+    return { dictionary, regenerated: 0 }
+  }
+
+  // 生成できた英例文だけ日本語訳を作る
+  const translationSources: TranslationSourceItem[] = []
+  for (const item of missing) {
+    const exampleEn = generatedExamples.get(item.id)
+    if (!exampleEn) continue
+    translationSources.push({
+      id: item.id,
+      partOfSpeech: item.partOfSpeech,
+      headword,
+      definitionEn: item.definitionEn,
+      exampleEn,
+    })
+  }
+
+  const translatedExamples = new Map<string, string | null>()
+  for (const groupItems of chunk(translationSources, CHUNK_SIZE)) {
+    try {
+      const translated = await translateChunk(groupItems)
+      for (const item of translated) {
+        if (!item.id) continue
+        translatedExamples.set(item.id, item.exampleJa ?? null)
+      }
+    } catch (error) {
+      console.error("REGENERATE TRANSLATE FAILED:", headword, error)
+    }
+  }
+
+  // dictionary を更新して返す（イミュータブルに新オブジェクトを作る）
+  const jaLocale = dictionary.locales?.ja
+  const updatedJaSenses = jaLocale ? { ...jaLocale.senses } : undefined
+
+  const updatedSenseGroups = dictionary.senseGroups.map((group) => ({
+    ...group,
+    senses: group.senses.map((sense) => {
+      const example = generatedExamples.get(sense.senseId)
+      if (!example) return sense
+
+      if (updatedJaSenses) {
+        const currentJa = updatedJaSenses[sense.senseId]
+        if (currentJa) {
+          updatedJaSenses[sense.senseId] = {
+            ...currentJa,
+            exampleTranslation: translatedExamples.get(sense.senseId) ?? null,
+          }
+        }
+      }
+
+      return { ...sense, example }
+    }),
+  }))
+
+  const updatedDictionary: RewrittenDictionary = {
+    ...dictionary,
+    senseGroups: updatedSenseGroups,
+    locales:
+      jaLocale && updatedJaSenses
+        ? { ...dictionary.locales, ja: { ...jaLocale, senses: updatedJaSenses } }
+        : dictionary.locales,
+  }
+
+  console.log(
+    "REGENERATE MISSING EXAMPLES DONE:",
+    headword,
+    generatedExamples.size,
+    "of",
+    missing.length
+  )
+
+  return { dictionary: updatedDictionary, regenerated: generatedExamples.size }
 }

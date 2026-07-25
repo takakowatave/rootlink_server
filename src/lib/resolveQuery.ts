@@ -10,6 +10,7 @@ import {
 import { getLemma } from "./lemma.js"
 import { generateSensesAI } from "./generateSensesAI.js"
 import { rerankSensesForLearners } from "./rerankSensesForLearners.js"
+import { regenerateMissingExamples } from "./rewriteDictionaryAI.js"
 
 /**
  * resolveQuery.ts
@@ -416,6 +417,35 @@ async function saveDictionary(
   }
 }
 
+/**
+ * キャッシュ hit した辞書に null example が残っていれば AI で埋めて保存する。
+ * Oxford は叩かない。失敗しても original dictionary を返して検索は続行する。
+ */
+async function hydrateCachedDictionary(
+  headword: string,
+  dictionary: RewrittenDictionary
+): Promise<RewrittenDictionary> {
+  const hasMissing = dictionary.senseGroups.some((group) =>
+    group.senses.some((sense) => !sense.example || sense.example.trim().length === 0)
+  )
+  if (!hasMissing) return dictionary
+
+  try {
+    const { dictionary: hydrated, regenerated } = await regenerateMissingExamples(
+      headword,
+      dictionary
+    )
+    if (regenerated === 0) return dictionary
+
+    await saveDictionary(headword, hydrated)
+    console.log("DICTIONARY HYDRATED:", headword, regenerated, "examples added")
+    return hydrated
+  } catch (error) {
+    console.error("HYDRATE CACHED DICTIONARY FAILED:", headword, error)
+    return dictionary
+  }
+}
+
 /* =========================
    Resolve helpers
 ========================= */
@@ -578,7 +608,8 @@ async function resolveFromCandidates(
 
     if (cached) {
       console.log("DICTIONARY CACHE HIT:", candidate)
-      return { resolved: candidate, dictionary: cached }
+      const hydrated = await hydrateCachedDictionary(candidate, cached)
+      return { resolved: candidate, dictionary: hydrated }
     }
 
     console.log("DICTIONARY CACHE MISS:", candidate)
@@ -599,7 +630,8 @@ async function resolveFromCandidates(
       const candidateCached = await getCachedDictionary(candidate)
       if (candidateCached) {
         console.log("DICTIONARY CACHE HIT BY CANDIDATE:", candidate)
-        return { resolved: candidate, dictionary: candidateCached }
+        const hydrated = await hydrateCachedDictionary(candidate, candidateCached)
+        return { resolved: candidate, dictionary: hydrated }
       }
       // headword 側にキャッシュがあっても candidate で別途保存する（後述）
     }
@@ -609,7 +641,8 @@ async function resolveFromCandidates(
       const cached = await getCachedDictionary(headword)
       if (cached) {
         console.log("DICTIONARY CACHE HIT BY HEADWORD:", headword)
-        return { resolved: headword, dictionary: cached }
+        const hydrated = await hydrateCachedDictionary(headword, cached)
+        return { resolved: headword, dictionary: hydrated }
       }
     }
 
@@ -692,12 +725,16 @@ async function resolveQueryInternal(raw: string): Promise<ResolveResult> {
     const byInflection = await findByInflection(input)
     if (byInflection) {
       console.log("INFLECTION HIT:", input, "->", byInflection.headword)
+      const hydrated = await hydrateCachedDictionary(
+        byInflection.headword,
+        byInflection.dictionary
+      )
       return {
         ok: true,
         resolved: byInflection.headword,
         changed: byInflection.headword !== input,
         redirectTo: `/word/${byInflection.headword}`,
-        dictionary: byInflection.dictionary,
+        dictionary: hydrated,
       }
     }
 
