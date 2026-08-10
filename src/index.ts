@@ -4,7 +4,7 @@ import { cors } from "hono/cors";
 import { serve } from "@hono/node-server";
 import auth from "./routes/auth.js";
 import stripe from "./routes/stripe.js";
-import { resolveQuery } from "./lib/resolveQuery.js";
+import { resolveQuery, ensureHookForCachedWord } from "./lib/resolveQuery.js";
 import { getSupabase } from "./lib/supabase.js";
 import { generateTTS, generateTTSInstructions, generatePhraseTTS, generatePhraseHeadwordTTS, generateWordExampleTTS } from "./lib/generateTTS.js";
 import { fetchOxfordAudioUrl } from "./lib/fetchOxfordAudio.js";
@@ -82,6 +82,27 @@ app.post("/resolve", rateLimit, async (c) => {
       },
       500
     )
+  }
+})
+
+/* =========================
+ * 4a. Hook lazy generation
+ *   OGP・単語詳細から fire-and-forget で叩く。
+ *   hook が空なら AI で生成→ dictionary_cache 更新。既存なら noop。
+ * ========================= */
+app.post("/hook", rateLimit, async (c) => {
+  try {
+    const body = await c.req.json().catch(() => ({}))
+    const word = typeof body?.word === "string" ? body.word.trim() : ""
+    if (!word || word.length > 100) {
+      return c.json({ ok: false, reason: "INVALID_WORD" }, 400)
+    }
+    const result = await ensureHookForCachedWord(word)
+    const status = result.ok ? 200 : result.reason === "NOT_CACHED" ? 404 : 200
+    return c.json(result, status)
+  } catch (error) {
+    console.error("HOOK HANDLER FAILED:", error)
+    return c.json({ ok: false, reason: "INTERNAL_ERROR" }, 500)
   }
 })
 

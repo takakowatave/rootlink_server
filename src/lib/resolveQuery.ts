@@ -505,6 +505,64 @@ async function hydrateFromCache(
   return withHook
 }
 
+/**
+ * /hook endpoint 用のエントリーポイント。
+ * キャッシュされている単語について hook 欠落時のみ生成→保存する。
+ * OGP 生成側から fire-and-forget で呼ぶことを想定。
+ */
+export type EnsureHookResult =
+  | { ok: true; generated: boolean; hook: string | null }
+  | { ok: false; reason: "NOT_CACHED" | "NO_CONTEXT" | "GENERATION_FAILED" }
+
+export async function ensureHookForCachedWord(
+  rawWord: string
+): Promise<EnsureHookResult> {
+  const headword = rawWord.trim().toLowerCase()
+  if (!headword) return { ok: false, reason: "NOT_CACHED" }
+
+  const dictionary = await getCachedDictionary(headword)
+  if (!dictionary) return { ok: false, reason: "NOT_CACHED" }
+
+  const existing = dictionary.locales?.ja?.etymology?.hook?.trim()
+  if (existing) {
+    return { ok: true, generated: false, hook: existing }
+  }
+
+  const jaLocale = dictionary.locales?.ja
+  if (!jaLocale) return { ok: false, reason: "NO_CONTEXT" }
+
+  try {
+    const hook = await generateHookForDictionary(headword, dictionary)
+    if (!hook) return { ok: false, reason: "GENERATION_FAILED" }
+
+    const updated: RewrittenDictionary = {
+      ...dictionary,
+      locales: {
+        ...dictionary.locales,
+        ja: {
+          ...jaLocale,
+          etymology: {
+            ...(jaLocale.etymology ?? {
+              originLanguageLabel: null,
+              sourceMeaning: null,
+              description: null,
+              hook: null,
+            }),
+            hook,
+          },
+        },
+      },
+    }
+
+    await saveDictionary(headword, updated)
+    console.log("HOOK HYDRATED (endpoint):", headword, `"${hook}"`)
+    return { ok: true, generated: true, hook }
+  } catch (error) {
+    console.error("ENSURE HOOK FAILED:", headword, error)
+    return { ok: false, reason: "GENERATION_FAILED" }
+  }
+}
+
 /* =========================
    Resolve helpers
 ========================= */
