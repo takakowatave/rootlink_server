@@ -11,6 +11,7 @@ import { getLemma } from "./lemma.js"
 import { generateSensesAI } from "./generateSensesAI.js"
 import { rerankSensesForLearners } from "./rerankSensesForLearners.js"
 import { regenerateMissingExamples } from "./rewriteDictionaryAI.js"
+import { generateHookForDictionary } from "./generateHookAI.js"
 
 /**
  * resolveQuery.ts
@@ -446,6 +447,122 @@ async function hydrateCachedDictionary(
   }
 }
 
+/**
+ * payload.locales.ja.etymology.hook が空なら AI で 1 行フックを生成して保存する。
+ * 既存 hook があれば noop。失敗時は元 dictionary を返す。
+ */
+async function hydrateHookIfMissing(
+  headword: string,
+  dictionary: RewrittenDictionary
+): Promise<RewrittenDictionary> {
+  const existing = dictionary.locales?.ja?.etymology?.hook
+  if (existing && existing.trim().length > 0) {
+    return dictionary
+  }
+
+  const jaLocale = dictionary.locales?.ja
+  if (!jaLocale) return dictionary
+
+  try {
+    const hook = await generateHookForDictionary(headword, dictionary)
+    if (!hook) return dictionary
+
+    const updated: RewrittenDictionary = {
+      ...dictionary,
+      locales: {
+        ...dictionary.locales,
+        ja: {
+          ...jaLocale,
+          etymology: {
+            ...(jaLocale.etymology ?? {
+              originLanguageLabel: null,
+              sourceMeaning: null,
+              description: null,
+              hook: null,
+            }),
+            hook,
+          },
+        },
+      },
+    }
+
+    await saveDictionary(headword, updated)
+    console.log("HOOK HYDRATED:", headword, `"${hook}"`)
+    return updated
+  } catch (error) {
+    console.error("HOOK HYDRATION FAILED:", headword, error)
+    return dictionary
+  }
+}
+
+/** キャッシュ hit 時の 2 種の hydration をまとめて実行する。 */
+async function hydrateFromCache(
+  headword: string,
+  dictionary: RewrittenDictionary
+): Promise<RewrittenDictionary> {
+  const withExamples = await hydrateCachedDictionary(headword, dictionary)
+  const withHook = await hydrateHookIfMissing(headword, withExamples)
+  return withHook
+}
+
+/**
+ * /hook endpoint 用のエントリーポイント。
+ * キャッシュされている単語について hook 欠落時のみ生成→保存する。
+ * OGP 生成側から fire-and-forget で呼ぶことを想定。
+ */
+export type EnsureHookResult =
+  | { ok: true; generated: boolean; hook: string | null }
+  | { ok: false; reason: "NOT_CACHED" | "NO_CONTEXT" | "GENERATION_FAILED" }
+
+export async function ensureHookForCachedWord(
+  rawWord: string
+): Promise<EnsureHookResult> {
+  const headword = rawWord.trim().toLowerCase()
+  if (!headword) return { ok: false, reason: "NOT_CACHED" }
+
+  const dictionary = await getCachedDictionary(headword)
+  if (!dictionary) return { ok: false, reason: "NOT_CACHED" }
+
+  const existing = dictionary.locales?.ja?.etymology?.hook?.trim()
+  if (existing) {
+    return { ok: true, generated: false, hook: existing }
+  }
+
+  const jaLocale = dictionary.locales?.ja
+  if (!jaLocale) return { ok: false, reason: "NO_CONTEXT" }
+
+  try {
+    const hook = await generateHookForDictionary(headword, dictionary)
+    if (!hook) return { ok: false, reason: "GENERATION_FAILED" }
+
+    const updated: RewrittenDictionary = {
+      ...dictionary,
+      locales: {
+        ...dictionary.locales,
+        ja: {
+          ...jaLocale,
+          etymology: {
+            ...(jaLocale.etymology ?? {
+              originLanguageLabel: null,
+              sourceMeaning: null,
+              description: null,
+              hook: null,
+            }),
+            hook,
+          },
+        },
+      },
+    }
+
+    await saveDictionary(headword, updated)
+    console.log("HOOK HYDRATED (endpoint):", headword, `"${hook}"`)
+    return { ok: true, generated: true, hook }
+  } catch (error) {
+    console.error("ENSURE HOOK FAILED:", headword, error)
+    return { ok: false, reason: "GENERATION_FAILED" }
+  }
+}
+
 /* =========================
    Resolve helpers
 ========================= */
@@ -608,7 +725,7 @@ async function resolveFromCandidates(
 
     if (cached) {
       console.log("DICTIONARY CACHE HIT:", candidate)
-      const hydrated = await hydrateCachedDictionary(candidate, cached)
+      const hydrated = await hydrateFromCache(candidate, cached)
       return { resolved: candidate, dictionary: hydrated }
     }
 
@@ -630,7 +747,7 @@ async function resolveFromCandidates(
       const candidateCached = await getCachedDictionary(candidate)
       if (candidateCached) {
         console.log("DICTIONARY CACHE HIT BY CANDIDATE:", candidate)
-        const hydrated = await hydrateCachedDictionary(candidate, candidateCached)
+        const hydrated = await hydrateFromCache(candidate, candidateCached)
         return { resolved: candidate, dictionary: hydrated }
       }
       // headword 側にキャッシュがあっても candidate で別途保存する（後述）
@@ -641,7 +758,7 @@ async function resolveFromCandidates(
       const cached = await getCachedDictionary(headword)
       if (cached) {
         console.log("DICTIONARY CACHE HIT BY HEADWORD:", headword)
-        const hydrated = await hydrateCachedDictionary(headword, cached)
+        const hydrated = await hydrateFromCache(headword, cached)
         return { resolved: headword, dictionary: hydrated }
       }
     }
@@ -725,7 +842,7 @@ async function resolveQueryInternal(raw: string): Promise<ResolveResult> {
     const byInflection = await findByInflection(input)
     if (byInflection) {
       console.log("INFLECTION HIT:", input, "->", byInflection.headword)
-      const hydrated = await hydrateCachedDictionary(
+      const hydrated = await hydrateFromCache(
         byInflection.headword,
         byInflection.dictionary
       )
