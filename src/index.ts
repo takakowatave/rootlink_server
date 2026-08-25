@@ -4,6 +4,7 @@ import { cors } from "hono/cors";
 import { serve } from "@hono/node-server";
 import auth from "./routes/auth.js";
 import stripe from "./routes/stripe.js";
+import revenuecat from "./routes/revenuecat.js";
 import { resolveQuery, ensureHookForCachedWord } from "./lib/resolveQuery.js";
 import { getSupabase } from "./lib/supabase.js";
 import { generateTTS, generateTTSInstructions, generatePhraseTTS, generatePhraseHeadwordTTS, generateWordExampleTTS } from "./lib/generateTTS.js";
@@ -45,6 +46,7 @@ app.get("/", (c) => c.text("OK"));
  * ========================= */
 app.route("/auth", auth);
 app.route("/stripe", stripe);
+app.route("/revenuecat", revenuecat);
 
 
 /* =========================
