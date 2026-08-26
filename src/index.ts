@@ -159,11 +159,13 @@ app.post("/audio", async (c) => {
       // 実際に音声が鳴らされる単語だけがコスト対象になる（節約）。
       const backfilledUrl = await fetchOxfordAudioUrl(word)
       if (backfilledUrl) {
-        const nextPayload: CachePayload = { ...cachedPayload, audio: { audioUrl: backfilledUrl } }
+        const nextPayload: CachePayload = { ...(cachedPayload ?? {}), audio: { audioUrl: backfilledUrl } }
         await supabase
           .from("dictionary_cache")
-          .update({ payload: nextPayload })
-          .eq("word_id", wordRow.id)
+          .upsert(
+            { word_id: wordRow.id, payload: nextPayload },
+            { onConflict: "word_id" },
+          )
         return c.json({ ok: true, audioUrl: backfilledUrl })
       }
     }
@@ -178,13 +180,15 @@ app.post("/audio", async (c) => {
     if (!audioPath) return c.json({ ok: false, reason: "TTS_FAILED" }, 500)
 
     // payloadに保存（audio + ttsInstructions を同時に）
-    if (wordRow?.id && cachedPayload) {
-      const nextPayload: CachePayload = { ...cachedPayload, audio: { audioPath } }
+    if (wordRow?.id) {
+      const nextPayload: CachePayload = { ...(cachedPayload ?? {}), audio: { audioPath } }
       if (instructions) nextPayload.ttsInstructions = instructions
       await supabase
         .from("dictionary_cache")
-        .update({ payload: nextPayload })
-        .eq("word_id", wordRow.id)
+        .upsert(
+          { word_id: wordRow.id, payload: nextPayload },
+          { onConflict: "word_id" },
+        )
     }
 
     const supabaseUrl = process.env.SUPABASE_URL!
