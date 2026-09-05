@@ -111,7 +111,7 @@ app.post("/hook", rateLimit, async (c) => {
 /* =========================
  * 5. Audio (TTS on demand)
  * ========================= */
-app.post("/audio", async (c) => {
+app.post("/audio", rateLimit, async (c) => {
   try {
     const body = await c.req.json()
     const word: string = body.word
