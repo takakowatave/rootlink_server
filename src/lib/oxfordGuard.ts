@@ -1,10 +1,12 @@
 import { getSupabase } from "./supabase.js"
+import { sendEmail } from "./sendEmail.js"
 
 /**
  * oxfordGuard.ts
  *
  * 責務:
  * - Oxford API の月次コール数を数え、上限を超えたら叩かせない
+ * - 閾値（50% / 80% / 100%）を跨いだ時点でメール通知する
  * - 検索失敗（該当なし・スペル補正結果）をキャッシュし、同じ入力での再課金を防ぐ
  *
  * 背景:
@@ -35,8 +37,11 @@ const NEGATIVE_TTL_HOURS = Number(
   process.env.RESOLVE_NEGATIVE_TTL_HOURS ?? 24 * 7
 )
 
-/** 使用量を DB から読み直す間隔。1コールごとに SELECT しないための緩衝。 */
-const USAGE_REFRESH_MS = 30_000
+/** 閾値通知の送り先。未設定なら通知しない（コール自体は通常どおり動く）。 */
+const ALERT_EMAIL = process.env.OXFORD_ALERT_EMAIL ?? ""
+
+/** 通知を出すレベル（上限に対する割合）。 */
+const ALERT_LEVELS = [50, 80, 100] as const
 
 /**
  * DB が読めないときに 1 インスタンスが暴走しないための保険。
@@ -67,12 +72,6 @@ export class OxfordBudgetExceededError extends Error {
    月次コール数
 ========================= */
 
-type UsageSnapshot = {
-  calls: number
-  readAt: number
-}
-
-let usageSnapshot: UsageSnapshot | null = null
 let processCalls = 0
 
 function currentMonth(): string {
@@ -82,117 +81,124 @@ function currentMonth(): string {
   return `${year}-${month}-01`
 }
 
-/** DB から当月のコール数を読む。読めなければ null。 */
-async function readUsageFromDb(): Promise<number | null> {
+/**
+ * コールを1件「予約」して、加算後の当月合計を返す。
+ *
+ * 数えてから撃つ。逆にしない。加算できなかったコールは撃たせない。
+ * 「叩いたが数えられていない」状態を作らないことが、この関数の存在理由。
+ */
+async function reserveCall(): Promise<number> {
+  const supabase = getSupabase()
+  const { data, error } = await supabase.rpc("reserve_oxford_call", {
+    p_calls: 1,
+  })
+
+  if (error) throw new Error(`OXFORD_RESERVE_FAILED: ${error.message}`)
+  if (typeof data !== "number") throw new Error("OXFORD_RESERVE_FAILED: no count")
+
+  return data
+}
+
+/** 閾値を跨いだらメールを送る。送信権はDB側でアトミックに1インスタンスだけが取る。 */
+async function notifyIfThresholdCrossed(total: number): Promise<void> {
+  if (!ALERT_EMAIL) return
+
+  // 到達した最大レベルを1つだけ扱う（50と80を同時に跨いでも1通）。
+  const ratio = (total / MONTHLY_CALL_LIMIT) * 100
+  const reached = [...ALERT_LEVELS].reverse().find((level) => ratio >= level)
+  if (!reached) return
+
   try {
     const supabase = getSupabase()
-    const { data, error } = await supabase
-      .from("oxford_api_usage")
-      .select("calls")
-      .eq("month", currentMonth())
-      .maybeSingle()
+    const { data, error } = await supabase.rpc("claim_oxford_notice", {
+      p_level: reached,
+    })
+    if (error || data !== true) return
 
-    if (error) {
-      console.error("OXFORD USAGE READ FAILED:", error.message)
-      return null
-    }
+    const subject =
+      reached >= 100
+        ? `[RootLink] Oxford API の月次上限に到達しました (${total}/${MONTHLY_CALL_LIMIT})`
+        : `[RootLink] Oxford API のコール数が ${reached}% に到達しました (${total}/${MONTHLY_CALL_LIMIT})`
 
-    const calls = (data as { calls?: unknown } | null)?.calls
-    return typeof calls === "number" ? calls : 0
+    const body =
+      reached >= 100
+        ? "上限に達したため、キャッシュに無い語の検索は停止しています。キャッシュ済みの語は通常どおり返ります。"
+        : "上限に近づいています。想定外の流入が無いか確認してください。"
+
+    await sendEmail({
+      to: ALERT_EMAIL,
+      subject,
+      html: `<!doctype html><html><body style="font-family:-apple-system,BlinkMacSystemFont,'Helvetica Neue',sans-serif;color:#111;line-height:1.7;">
+<div style="max-width:480px;margin:0 auto;padding:32px 24px;">
+<h2 style="font-size:18px;margin:0 0 16px;">Oxford API 使用量アラート</h2>
+<p style="font-size:14px;margin:0 0 12px;">対象月: <strong>${currentMonth()}</strong><br>
+コール数: <strong>${total}</strong> / ${MONTHLY_CALL_LIMIT}（${Math.round(ratio)}%）</p>
+<p style="font-size:14px;margin:0 0 12px;">${body}</p>
+<p style="font-size:13px;color:#666;margin:16px 0 0;">
+上限は環境変数 OXFORD_MONTHLY_CALL_LIMIT で変更できます。</p>
+</div></body></html>`,
+    })
+
+    console.log("OXFORD ALERT SENT:", reached, total, "/", MONTHLY_CALL_LIMIT)
   } catch (error) {
-    console.error("OXFORD USAGE READ THREW:", error)
-    return null
+    // 通知の失敗で検索を止めない。上限そのものは別で効いている。
+    console.error("OXFORD ALERT FAILED:", error)
   }
 }
 
 /**
- * Oxford を叩いてよいか判定する。
- * 上限に達している場合は OxfordBudgetExceededError を投げる。
+ * 上限チェック → コール数の予約 → 実行。
+ *
+ * 予約に失敗した場合は Oxford を呼ばない。
+ * 数えられないコールを撃つのが、これまでの請求の原因だったため。
  */
-export async function assertOxfordBudget(): Promise<void> {
+export async function withOxfordBudget<T>(fn: () => Promise<T>): Promise<T> {
   if (processCalls >= PROCESS_CALL_CEILING) {
     console.error("OXFORD PROCESS CEILING HIT:", processCalls)
     throw new OxfordBudgetExceededError(processCalls, PROCESS_CALL_CEILING)
   }
 
-  const fresh =
-    usageSnapshot !== null && Date.now() - usageSnapshot.readAt < USAGE_REFRESH_MS
-
-  if (!fresh) {
-    const calls = await readUsageFromDb()
-    if (calls !== null) {
-      usageSnapshot = { calls, readAt: Date.now() }
-    }
-  }
-
-  // DB が一度も読めていない場合は判断材料がないので通す。
-  // その場合も PROCESS_CALL_CEILING が上限として効く。
-  if (usageSnapshot === null) return
-
-  if (usageSnapshot.calls >= MONTHLY_CALL_LIMIT) {
-    console.error(
-      "OXFORD BUDGET EXCEEDED:",
-      usageSnapshot.calls,
-      "/",
-      MONTHLY_CALL_LIMIT
-    )
-    throw new OxfordBudgetExceededError(usageSnapshot.calls, MONTHLY_CALL_LIMIT)
-  }
-}
-
-/** Oxford を実際に叩いた回数を記録する。失敗レスポンスも 1 コールとして数える。 */
-export async function recordOxfordCall(count = 1): Promise<void> {
-  processCalls += count
-
-  // ローカルの見積もりを先に進める。DB 反映が遅れても上限を踏み越えにくくする。
-  if (usageSnapshot) {
-    usageSnapshot = {
-      calls: usageSnapshot.calls + count,
-      readAt: usageSnapshot.readAt,
-    }
-  }
-
+  let total: number
   try {
-    const supabase = getSupabase()
-    const { data, error } = await supabase.rpc("increment_oxford_calls", {
-      p_calls: count,
-    })
-
-    if (error) {
-      console.error("OXFORD USAGE INCREMENT FAILED:", error.message)
-      return
-    }
-
-    if (typeof data === "number") {
-      usageSnapshot = { calls: data, readAt: Date.now() }
-    }
+    total = await reserveCall()
   } catch (error) {
-    console.error("OXFORD USAGE INCREMENT THREW:", error)
+    console.error("OXFORD RESERVE FAILED, BLOCKING CALL:", error)
+    throw new OxfordBudgetExceededError(-1, MONTHLY_CALL_LIMIT)
   }
+
+  processCalls += 1
+
+  await notifyIfThresholdCrossed(total)
+
+  if (total > MONTHLY_CALL_LIMIT) {
+    console.error("OXFORD BUDGET EXCEEDED:", total, "/", MONTHLY_CALL_LIMIT)
+    throw new OxfordBudgetExceededError(total, MONTHLY_CALL_LIMIT)
+  }
+
+  return fn()
 }
 
-/**
- * 上限チェック → 実行 → コール数記録 をまとめる。
- * 例外が出ても「叩いた」事実は記録する。
- */
-export async function withOxfordBudget<T>(fn: () => Promise<T>): Promise<T> {
-  await assertOxfordBudget()
-  try {
-    return await fn()
-  } finally {
-    await recordOxfordCall(1)
-  }
-}
-
-/** 監視・管理用に当月の使用状況を返す。 */
+/** 当月の使用状況を返す。監視・確認用。 */
 export async function getOxfordUsage(): Promise<{
   month: string
-  calls: number | null
+  calls: number
   limit: number
 }> {
-  const calls = await readUsageFromDb()
-  if (calls !== null) usageSnapshot = { calls, readAt: Date.now() }
-  return { month: currentMonth(), calls, limit: MONTHLY_CALL_LIMIT }
+  const supabase = getSupabase()
+  const { data, error } = await supabase
+    .from("oxford_api_usage")
+    .select("calls")
+    .eq("month", currentMonth())
+    .maybeSingle()
+
+  if (error) throw new Error(error.message)
+
+  const calls = (data as { calls?: unknown } | null)?.calls
+  return {
+    month: currentMonth(),
+    calls: typeof calls === "number" ? calls : 0,
+    limit: MONTHLY_CALL_LIMIT,
+  }
 }
 
 /* =========================
