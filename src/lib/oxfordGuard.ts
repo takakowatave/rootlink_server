@@ -24,12 +24,13 @@ import { sendEmail } from "./sendEmail.js"
 
 /**
  * 月あたりに許可する Oxford コール数。
- * 無料枠 5,000 を既定値にしない。無料枠が丸ごと残っている前提は成立しないうえ、
- * 実需は月 200 コール程度（新規語 週10〜20語 × 最大2コール）しかないため。
+ * 既定は無料枠と同じ 5,000。ここに達したら Oxford を一切叩かない。
+ * 実需は月 200 コール程度（新規語 週10〜20語 × 最大2コール）なので、
+ * 通常運転で上限に当たることはない。当たったら異常が起きている。
  * 環境変数 OXFORD_MONTHLY_CALL_LIMIT で上書きする。
  */
 const MONTHLY_CALL_LIMIT = Number(
-  process.env.OXFORD_MONTHLY_CALL_LIMIT ?? 1000
+  process.env.OXFORD_MONTHLY_CALL_LIMIT ?? 5000
 )
 
 /** ネガティブキャッシュの保持時間。 */
