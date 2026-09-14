@@ -139,14 +139,24 @@ router.post("/webhook", async (c) => {
           ? new Date(event.expiration_at_ms).toISOString()
           : null
 
+        // period_type=TRIAL は INITIAL_PURCHASE でのみ来る。RENEWAL は trial→paid 変換後なので常に active
+        const status =
+          event.type === "INITIAL_PURCHASE" && event.period_type === "TRIAL"
+            ? "trialing"
+            : "active"
+
+        // trial_used は monotonic (一度 true にしたら不可逆)。
+        // Apple/Google の intro offer eligibility は period_type 問わず初回購入で消費されるため、
+        // positive イベント全部で true を書く (webhook 順序ズレへの防御)。
         await supabase.from("subscriptions").upsert(
           {
             user_id: userId,
             plan,
-            status: "active",
+            status,
             store,
             revenuecat_product_id: event.product_id ?? null,
             expires_at: expiresAt,
+            trial_used: true,
             updated_at: new Date().toISOString(),
           },
           { onConflict: "user_id" }
@@ -156,6 +166,7 @@ router.post("/webhook", async (c) => {
           userId,
           plan,
           store,
+          status,
           event.type
         )
         break

@@ -164,6 +164,7 @@ router.post("/webhook", async (c) => {
             stripe_subscription_id: subscriptionId,
             plan,
             status,
+            store: "stripe",
             updated_at: new Date().toISOString(),
           },
           { onConflict: "user_id" }
