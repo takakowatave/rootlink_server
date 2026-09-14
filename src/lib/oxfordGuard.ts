@@ -74,11 +74,24 @@ export class OxfordBudgetExceededError extends Error {
 
 let processCalls = 0
 
-function currentMonth(): string {
+/**
+ * Oxford の請求期間はリセット日（既定20日）始まり。
+ * 暦月で数えると境界が20日ずれ、上限が実際の請求と噛み合わない。
+ */
+const BILLING_RESET_DAY = Number(process.env.OXFORD_BILLING_RESET_DAY ?? 20)
+
+function currentPeriodStart(): string {
   const now = new Date()
   const year = now.getUTCFullYear()
-  const month = String(now.getUTCMonth() + 1).padStart(2, "0")
-  return `${year}-${month}-01`
+  const month = now.getUTCMonth()
+  const day = now.getUTCDate()
+
+  const start =
+    day >= BILLING_RESET_DAY
+      ? new Date(Date.UTC(year, month, BILLING_RESET_DAY))
+      : new Date(Date.UTC(year, month - 1, BILLING_RESET_DAY))
+
+  return start.toISOString().slice(0, 10)
 }
 
 /**
@@ -90,6 +103,7 @@ function currentMonth(): string {
 async function reserveCall(): Promise<number> {
   const supabase = getSupabase()
   const { data, error } = await supabase.rpc("reserve_oxford_call", {
+    p_period_start: currentPeriodStart(),
     p_calls: 1,
   })
 
@@ -111,6 +125,7 @@ async function notifyIfThresholdCrossed(total: number): Promise<void> {
   try {
     const supabase = getSupabase()
     const { data, error } = await supabase.rpc("claim_oxford_notice", {
+      p_period_start: currentPeriodStart(),
       p_level: reached,
     })
     if (error || data !== true) return
@@ -131,7 +146,7 @@ async function notifyIfThresholdCrossed(total: number): Promise<void> {
       html: `<!doctype html><html><body style="font-family:-apple-system,BlinkMacSystemFont,'Helvetica Neue',sans-serif;color:#111;line-height:1.7;">
 <div style="max-width:480px;margin:0 auto;padding:32px 24px;">
 <h2 style="font-size:18px;margin:0 0 16px;">Oxford API 使用量アラート</h2>
-<p style="font-size:14px;margin:0 0 12px;">対象月: <strong>${currentMonth()}</strong><br>
+<p style="font-size:14px;margin:0 0 12px;">期間開始: <strong>${currentPeriodStart()}</strong><br>
 コール数: <strong>${total}</strong> / ${MONTHLY_CALL_LIMIT}（${Math.round(ratio)}%）</p>
 <p style="font-size:14px;margin:0 0 12px;">${body}</p>
 <p style="font-size:13px;color:#666;margin:16px 0 0;">
@@ -180,7 +195,7 @@ export async function withOxfordBudget<T>(fn: () => Promise<T>): Promise<T> {
 
 /** 当月の使用状況を返す。監視・確認用。 */
 export async function getOxfordUsage(): Promise<{
-  month: string
+  periodStart: string
   calls: number
   limit: number
 }> {
@@ -188,14 +203,14 @@ export async function getOxfordUsage(): Promise<{
   const { data, error } = await supabase
     .from("oxford_api_usage")
     .select("calls")
-    .eq("month", currentMonth())
+    .eq("period_start", currentPeriodStart())
     .maybeSingle()
 
   if (error) throw new Error(error.message)
 
   const calls = (data as { calls?: unknown } | null)?.calls
   return {
-    month: currentMonth(),
+    periodStart: currentPeriodStart(),
     calls: typeof calls === "number" ? calls : 0,
     limit: MONTHLY_CALL_LIMIT,
   }

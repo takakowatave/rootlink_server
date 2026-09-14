@@ -10,7 +10,7 @@ import { getSupabase } from "./lib/supabase.js";
 import { generateTTS, generateTTSInstructions, generatePhraseTTS, generatePhraseHeadwordTTS, generateWordExampleTTS } from "./lib/generateTTS.js";
 import { fetchOxfordAudioUrl } from "./lib/fetchOxfordAudio.js";
 import { rateLimit } from "./lib/rateLimit.js";
-import { OxfordBudgetExceededError } from "./lib/oxfordGuard.js";
+import { OxfordBudgetExceededError, getOxfordUsage } from "./lib/oxfordGuard.js";
 
 const app = new Hono();
 
@@ -113,6 +113,16 @@ app.get("/resolve", rateLimit, async (c) => {
   const raw = c.req.query("query")
   const query = typeof raw === "string" ? raw.trim() : ""
   return handleResolve(c, query)
+})
+
+// 使用状況の確認用。ダッシュボードを開かずに現在値を取れるようにする。
+app.get("/oxford/usage", async (c) => {
+  try {
+    return c.json({ ok: true, ...(await getOxfordUsage()) })
+  } catch (error) {
+    console.error("OXFORD USAGE HANDLER FAILED:", error)
+    return c.json({ ok: false, reason: "INTERNAL_ERROR" }, 500)
+  }
 })
 
 /* =========================
