@@ -10,6 +10,7 @@ import { getSupabase } from "./lib/supabase.js";
 import { generateTTS, generateTTSInstructions, generatePhraseTTS, generatePhraseHeadwordTTS, generateWordExampleTTS } from "./lib/generateTTS.js";
 import { fetchOxfordAudioUrl } from "./lib/fetchOxfordAudio.js";
 import { rateLimit } from "./lib/rateLimit.js";
+import { OxfordBudgetExceededError } from "./lib/oxfordGuard.js";
 
 const app = new Hono();
 
@@ -62,6 +63,18 @@ app.post("/resolve", rateLimit, async (c) => {
     const result = await resolveQuery(query)
     return c.json(result)
   } catch (error) {
+    // 月次コール上限に達した。キャッシュ済みの語は通常どおり返るため、
+    // ここに来るのはキャッシュに無い語だけ。
+    if (error instanceof OxfordBudgetExceededError) {
+      console.error(
+        "RESOLVE BLOCKED BY BUDGET:",
+        error.used,
+        "/",
+        error.limit
+      )
+      return c.json({ ok: false, reason: "UNAVAILABLE" }, 503)
+    }
+
     if (
       error instanceof Error &&
       error.name === "OxfordUsageLimitError"
