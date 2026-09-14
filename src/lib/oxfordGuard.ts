@@ -20,9 +20,14 @@ import { getSupabase } from "./supabase.js"
    設定
 ========================= */
 
-/** 月あたりに許可する Oxford コール数。無料枠 5,000 に対して余裕を持たせる。 */
+/**
+ * 月あたりに許可する Oxford コール数。
+ * 無料枠 5,000 を既定値にしない。無料枠が丸ごと残っている前提は成立しないうえ、
+ * 実需は月 200 コール程度（新規語 週10〜20語 × 最大2コール）しかないため。
+ * 環境変数 OXFORD_MONTHLY_CALL_LIMIT で上書きする。
+ */
 const MONTHLY_CALL_LIMIT = Number(
-  process.env.OXFORD_MONTHLY_CALL_LIMIT ?? 4500
+  process.env.OXFORD_MONTHLY_CALL_LIMIT ?? 1000
 )
 
 /** ネガティブキャッシュの保持時間。 */
