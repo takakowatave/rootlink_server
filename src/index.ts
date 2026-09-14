@@ -1,5 +1,5 @@
 import 'dotenv/config'
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
 import { serve } from "@hono/node-server";
 import auth from "./routes/auth.js";
@@ -53,10 +53,13 @@ app.route("/revenuecat", revenuecat);
 /* =========================
  * 4. resolveQuery
  * ========================= */
-app.post("/resolve", rateLimit, async (c) => {
+/**
+ * GET と POST で同じ処理を共有する。
+ * GET を用意しているのは、Next.js の Data Cache が GET しか載せないため。
+ * SSR から POST で叩くとページ表示のたびに毎回ここへ来る。
+ */
+async function handleResolve(c: Context, query: string) {
   try {
-    const body = await c.req.json()
-    const query = typeof body?.query === "string" ? body.query.trim() : ""
     if (!query || query.length > 100) {
       return c.json({ ok: false, reason: "INVALID_QUERY" }, 400)
     }
@@ -98,6 +101,18 @@ app.post("/resolve", rateLimit, async (c) => {
       500
     )
   }
+}
+
+app.post("/resolve", rateLimit, async (c) => {
+  const body = await c.req.json().catch(() => ({}))
+  const query = typeof body?.query === "string" ? body.query.trim() : ""
+  return handleResolve(c, query)
+})
+
+app.get("/resolve", rateLimit, async (c) => {
+  const raw = c.req.query("query")
+  const query = typeof raw === "string" ? raw.trim() : ""
+  return handleResolve(c, query)
 })
 
 /* =========================
