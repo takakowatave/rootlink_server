@@ -1,4 +1,5 @@
 import { Hono } from "hono"
+import { timingSafeEqual } from "node:crypto"
 import { getSupabase } from "../lib/supabase.js"
 
 /**
@@ -29,6 +30,7 @@ type RevenueCatEventType =
   | "TRANSFER"
   | "NON_RENEWING_PURCHASE"
   | "SUBSCRIBER_ALIAS"
+  | "REFUND"
   | "TEST"
 
 type RevenueCatEvent = {
@@ -78,6 +80,13 @@ function normalizeStore(raw: string | undefined | null): Store | null {
   return null
 }
 
+function secretsMatch(a: string, b: string): boolean {
+  const bufA = Buffer.from(a)
+  const bufB = Buffer.from(b)
+  if (bufA.length !== bufB.length) return false
+  return timingSafeEqual(bufA, bufB)
+}
+
 const router = new Hono()
 
 router.post("/webhook", async (c) => {
@@ -89,7 +98,7 @@ router.post("/webhook", async (c) => {
     console.error("REVENUECAT WEBHOOK: secret not configured")
     return c.json({ ok: false, reason: "MISCONFIGURED" }, 500)
   }
-  if (!provided || provided !== secret) {
+  if (!provided || !secretsMatch(provided, secret)) {
     return c.json({ ok: false, reason: "UNAUTHORIZED" }, 401)
   }
 
@@ -175,6 +184,8 @@ router.post("/webhook", async (c) => {
       case "CANCELLATION": {
         // ユーザーが解約意思表示。期限までは有効なので status は active のまま。
         // 期限だけ更新しておく。
+        // 既知のトレードオフ: EXPIRATION webhook が届くまで getUserPlan は premium を返し続ける。
+        // RC の3日リトライで実務上は問題ないが、「解約したのにまだ使える」調査時はここが起点。
         if (!userId) break
         const expiresAt = event.expiration_at_ms
           ? new Date(event.expiration_at_ms).toISOString()
@@ -195,11 +206,27 @@ router.post("/webhook", async (c) => {
         await supabase
           .from("subscriptions")
           .update({
-            status: "canceled",
+            status: "expired",
             updated_at: new Date().toISOString(),
           })
           .eq("user_id", userId)
         console.log("REVENUECAT SUBSCRIPTION EXPIRED:", userId)
+        break
+      }
+
+      case "REFUND": {
+        // 返金は Apple/Google 側で処理され、entitlement は即 revoke される。
+        // status='expired' + expires_at=now() で即失効させる。
+        if (!userId) break
+        await supabase
+          .from("subscriptions")
+          .update({
+            status: "expired",
+            expires_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+          })
+          .eq("user_id", userId)
+        console.log("REVENUECAT SUBSCRIPTION REFUNDED:", userId)
         break
       }
 
