@@ -157,6 +157,8 @@ router.post("/webhook", async (c) => {
         // trial_used は monotonic (一度 true にしたら不可逆)。
         // Apple/Google の intro offer eligibility は period_type 問わず初回購入で消費されるため、
         // positive イベント全部で true を書く (webhook 順序ズレへの防御)。
+        // will_renew は「期間終了時に自動更新するか」の意思表示。RENEWAL / UNCANCELLATION /
+        // INITIAL_PURCHASE / PRODUCT_CHANGE は全て「更新する」意思なので true。
         await supabase.from("subscriptions").upsert(
           {
             user_id: userId,
@@ -166,6 +168,7 @@ router.post("/webhook", async (c) => {
             revenuecat_product_id: event.product_id ?? null,
             expires_at: expiresAt,
             trial_used: true,
+            will_renew: true,
             updated_at: new Date().toISOString(),
           },
           { onConflict: "user_id" }
@@ -183,7 +186,7 @@ router.post("/webhook", async (c) => {
 
       case "CANCELLATION": {
         // ユーザーが解約意思表示。期限までは有効なので status は active のまま。
-        // 期限だけ更新しておく。
+        // will_renew=false にして UI で「○月○日で終了します」を出す。
         // 既知のトレードオフ: EXPIRATION webhook が届くまで getUserPlan は premium を返し続ける。
         // RC の3日リトライで実務上は問題ないが、「解約したのにまだ使える」調査時はここが起点。
         if (!userId) break
@@ -194,6 +197,7 @@ router.post("/webhook", async (c) => {
           .from("subscriptions")
           .update({
             expires_at: expiresAt,
+            will_renew: false,
             updated_at: new Date().toISOString(),
           })
           .eq("user_id", userId)
