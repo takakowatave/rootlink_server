@@ -15,3 +15,9 @@ gcloud run deploy rootlink-server-v2 \
   --region asia-northeast1 \
   --allow-unauthenticated \
   --clear-base-image
+
+# デプロイ後の最新リビジョン名を表示（ロールバック時に一目でわかるように）
+latest_revision=$(gcloud run services describe rootlink-server-v2 \
+  --region asia-northeast1 \
+  --format="value(status.latestReadyRevisionName)")
+echo "deploy.sh: latest ready revision = $latest_revision"
