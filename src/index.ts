@@ -11,6 +11,7 @@ import { generateTTS, generateTTSInstructions, generatePhraseTTS, generatePhrase
 import { fetchOxfordAudioUrl } from "./lib/fetchOxfordAudio.js";
 import { rateLimit } from "./lib/rateLimit.js";
 import { OxfordBudgetExceededError, getOxfordUsage } from "./lib/oxfordGuard.js";
+import { updateDictionaryCachePayload } from "./lib/dictionaryCache.js";
 
 const app = new Hono();
 
@@ -197,13 +198,12 @@ app.post("/audio", rateLimit, async (c) => {
       // 実際に音声が鳴らされる単語だけがコスト対象になる（節約）。
       const backfilledUrl = await fetchOxfordAudioUrl(word)
       if (backfilledUrl) {
-        const nextPayload: CachePayload = { ...(cachedPayload ?? {}), audio: { audioUrl: backfilledUrl } }
-        await supabase
-          .from("dictionary_cache")
-          .upsert(
-            { word_id: wordRow.id, payload: nextPayload },
-            { onConflict: "word_id" },
-          )
+        // 書き込む直前に最新の payload を再読込して該当キーだけ更新する。
+        // 例文音声の並列生成などで payload が別途更新されていても潰さない。
+        await updateDictionaryCachePayload(wordRow.id, (latest) => ({
+          ...(latest ?? {}),
+          audio: { audioUrl: backfilledUrl },
+        }))
         return c.json({ ok: true, audioUrl: backfilledUrl })
       }
     }
@@ -217,16 +217,14 @@ app.post("/audio", rateLimit, async (c) => {
     const audioPath = await generateTTS(word, instructions)
     if (!audioPath) return c.json({ ok: false, reason: "TTS_FAILED" }, 500)
 
-    // payloadに保存（audio + ttsInstructions を同時に）
+    // payloadに保存（audio + ttsInstructions を同時に）。
+    // 直前スナップショットで丸上書きせず、最新を読み直して該当キーのみ patch する。
     if (wordRow?.id) {
-      const nextPayload: CachePayload = { ...(cachedPayload ?? {}), audio: { audioPath } }
-      if (instructions) nextPayload.ttsInstructions = instructions
-      await supabase
-        .from("dictionary_cache")
-        .upsert(
-          { word_id: wordRow.id, payload: nextPayload },
-          { onConflict: "word_id" },
-        )
+      await updateDictionaryCachePayload(wordRow.id, (latest) => {
+        const next: CachePayload = { ...(latest ?? {}), audio: { audioPath } }
+        if (instructions) next.ttsInstructions = instructions
+        return next
+      })
     }
 
     const supabaseUrl = process.env.SUPABASE_URL!
@@ -308,14 +306,13 @@ app.post("/audio/word/example", async (c) => {
     const audioPath = await generateWordExampleTTS(senseId, exampleText)
     if (!audioPath) return c.json({ ok: false, reason: "TTS_FAILED" }, 500)
 
-    const nextAudioMap: SenseAudioMap = {
-      ...(payload.senseAudioPaths ?? {}),
-      [senseId]: audioPath,
-    }
-    await supabase
-      .from("dictionary_cache")
-      .update({ payload: { ...payload, senseAudioPaths: nextAudioMap } })
-      .eq("word_id", wordRow.id)
+    // 書き込む直前に最新 payload を再読込して senseAudioPaths[senseId] だけ更新する。
+    // /audio 側で更新された audio / ttsInstructions を上書きしない。
+    await updateDictionaryCachePayload(wordRow.id, (latest) => {
+      const latestMap = (latest?.senseAudioPaths as SenseAudioMap | undefined) ?? {}
+      const nextMap: SenseAudioMap = { ...latestMap, [senseId]: audioPath }
+      return { ...(latest ?? {}), senseAudioPaths: nextMap }
+    })
 
     const audioUrl = `${supabaseUrl}/storage/v1/object/public/${audioPath}`
     return c.json({ ok: true, audioUrl })

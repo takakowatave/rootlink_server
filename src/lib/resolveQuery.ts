@@ -19,6 +19,7 @@ import {
   bumpNegativeHit,
   OxfordBudgetExceededError,
 } from "./oxfordGuard.js"
+import { updateDictionaryCachePayload, AUDIO_PRESERVED_KEYS } from "./dictionaryCache.js"
 
 /**
  * resolveQuery.ts
@@ -428,21 +429,34 @@ async function getCachedDictionary(
   return row.payload as RewrittenDictionary
 }
 
-/** 完成済み payload だけを保存する。 */
+/** 完成済み payload だけを保存する。
+ *
+ * 2026-09-16 事故対策: /audio と /audio/word/example が payload に
+ * 追加する audio / ttsInstructions / senseAudioPaths は、この関数の
+ * 書き込みで消えないよう、書き込む直前に最新 payload を読み直して
+ * 該当キーを引き継いだうえで upsert する。
+ */
 async function saveDictionary(
   word: string,
   payload: RewrittenDictionary
 ): Promise<void> {
-  const supabase = getSupabase()
   const wordId = await ensureWordId(word)
 
-  const { error } = await supabase.from("dictionary_cache").upsert({
-    word_id: wordId,
-    payload,
+  const { ok } = await updateDictionaryCachePayload(wordId, (latest) => {
+    const merged: Record<string, unknown> = { ...(payload as unknown as Record<string, unknown>) }
+    if (latest) {
+      for (const key of AUDIO_PRESERVED_KEYS) {
+        // 入力 payload に無く、DB 側に値があるなら維持する。
+        // 入力 payload に既にあるならそちらを尊重する（意図的な差替を許す）。
+        if (!(key in merged) && latest[key] !== undefined) {
+          merged[key] = latest[key]
+        }
+      }
+    }
+    return merged
   })
-
-  if (error) {
-    throw error
+  if (!ok) {
+    throw new Error(`saveDictionary: failed to persist ${word}`)
   }
 
   // 語源パーツ × 単語のマッピングを蓄積
@@ -453,6 +467,7 @@ async function saveDictionary(
       .map((part_text) => ({ part_text, word: word.toLowerCase() }))
 
     if (rows.length > 0) {
+      const supabase = getSupabase()
       await supabase
         .from("etymology_part_words")
         .upsert(rows, { onConflict: "part_text,word" })
