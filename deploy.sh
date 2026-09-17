@@ -1,14 +1,17 @@
 #!/bin/bash
 set -e
 
-: "${SUPABASE_URL:?SUPABASE_URL is required}"
-: "${SUPABASE_ANON_KEY:?SUPABASE_ANON_KEY is required}"
-: "${SUPABASE_SERVICE_ROLE_KEY:?SUPABASE_SERVICE_ROLE_KEY is required}"
+# 本番デプロイは main からのみ。develop や feature branch から誤って
+# 打つのを防ぐため、ブランチが main でなければ止まる。
+current_branch=$(git rev-parse --abbrev-ref HEAD)
+if [ "$current_branch" != "main" ]; then
+  echo "deploy.sh: 本番デプロイは main からのみ。現在のブランチ: $current_branch" >&2
+  exit 1
+fi
 
+# 環境変数は Cloud Run 側に設定済みなので、ここでは注入しない。
 gcloud run deploy rootlink-server-v2 \
   --source . \
   --region asia-northeast1 \
   --allow-unauthenticated \
-  --clear-base-image \
-  --set-build-env-vars="SUPABASE_URL=${SUPABASE_URL},SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}" \
-  --update-env-vars="SUPABASE_URL=${SUPABASE_URL},SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY},SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}"
+  --clear-base-image
