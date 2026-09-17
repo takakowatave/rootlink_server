@@ -1,4 +1,5 @@
 import { Hono } from "hono"
+import { timingSafeEqual } from "node:crypto"
 import { getSupabase } from "../lib/supabase.js"
 
 /**
@@ -29,6 +30,7 @@ type RevenueCatEventType =
   | "TRANSFER"
   | "NON_RENEWING_PURCHASE"
   | "SUBSCRIBER_ALIAS"
+  | "REFUND"
   | "TEST"
 
 type RevenueCatEvent = {
@@ -78,6 +80,13 @@ function normalizeStore(raw: string | undefined | null): Store | null {
   return null
 }
 
+function secretsMatch(a: string, b: string): boolean {
+  const bufA = Buffer.from(a)
+  const bufB = Buffer.from(b)
+  if (bufA.length !== bufB.length) return false
+  return timingSafeEqual(bufA, bufB)
+}
+
 const router = new Hono()
 
 router.post("/webhook", async (c) => {
@@ -89,7 +98,7 @@ router.post("/webhook", async (c) => {
     console.error("REVENUECAT WEBHOOK: secret not configured")
     return c.json({ ok: false, reason: "MISCONFIGURED" }, 500)
   }
-  if (!provided || provided !== secret) {
+  if (!provided || !secretsMatch(provided, secret)) {
     return c.json({ ok: false, reason: "UNAUTHORIZED" }, 401)
   }
 
@@ -139,14 +148,27 @@ router.post("/webhook", async (c) => {
           ? new Date(event.expiration_at_ms).toISOString()
           : null
 
+        // period_type=TRIAL は INITIAL_PURCHASE でのみ来る。RENEWAL は trial→paid 変換後なので常に active
+        const status =
+          event.type === "INITIAL_PURCHASE" && event.period_type === "TRIAL"
+            ? "trialing"
+            : "active"
+
+        // trial_used は monotonic (一度 true にしたら不可逆)。
+        // Apple/Google の intro offer eligibility は period_type 問わず初回購入で消費されるため、
+        // positive イベント全部で true を書く (webhook 順序ズレへの防御)。
+        // will_renew は「期間終了時に自動更新するか」の意思表示。RENEWAL / UNCANCELLATION /
+        // INITIAL_PURCHASE / PRODUCT_CHANGE は全て「更新する」意思なので true。
         await supabase.from("subscriptions").upsert(
           {
             user_id: userId,
             plan,
-            status: "active",
+            status,
             store,
             revenuecat_product_id: event.product_id ?? null,
             expires_at: expiresAt,
+            trial_used: true,
+            will_renew: true,
             updated_at: new Date().toISOString(),
           },
           { onConflict: "user_id" }
@@ -156,6 +178,7 @@ router.post("/webhook", async (c) => {
           userId,
           plan,
           store,
+          status,
           event.type
         )
         break
@@ -163,7 +186,9 @@ router.post("/webhook", async (c) => {
 
       case "CANCELLATION": {
         // ユーザーが解約意思表示。期限までは有効なので status は active のまま。
-        // 期限だけ更新しておく。
+        // will_renew=false にして UI で「○月○日で終了します」を出す。
+        // 既知のトレードオフ: EXPIRATION webhook が届くまで getUserPlan は premium を返し続ける。
+        // RC の3日リトライで実務上は問題ないが、「解約したのにまだ使える」調査時はここが起点。
         if (!userId) break
         const expiresAt = event.expiration_at_ms
           ? new Date(event.expiration_at_ms).toISOString()
@@ -172,6 +197,7 @@ router.post("/webhook", async (c) => {
           .from("subscriptions")
           .update({
             expires_at: expiresAt,
+            will_renew: false,
             updated_at: new Date().toISOString(),
           })
           .eq("user_id", userId)
@@ -184,11 +210,27 @@ router.post("/webhook", async (c) => {
         await supabase
           .from("subscriptions")
           .update({
-            status: "canceled",
+            status: "expired",
             updated_at: new Date().toISOString(),
           })
           .eq("user_id", userId)
         console.log("REVENUECAT SUBSCRIPTION EXPIRED:", userId)
+        break
+      }
+
+      case "REFUND": {
+        // 返金は Apple/Google 側で処理され、entitlement は即 revoke される。
+        // status='expired' + expires_at=now() で即失効させる。
+        if (!userId) break
+        await supabase
+          .from("subscriptions")
+          .update({
+            status: "expired",
+            expires_at: new Date().toISOString(),
+            updated_at: new Date().toISOString(),
+          })
+          .eq("user_id", userId)
+        console.log("REVENUECAT SUBSCRIPTION REFUNDED:", userId)
         break
       }
 

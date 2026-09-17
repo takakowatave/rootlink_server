@@ -1,5 +1,5 @@
 import 'dotenv/config'
-import { Hono } from "hono";
+import { Hono, type Context } from "hono";
 import { cors } from "hono/cors";
 import { serve } from "@hono/node-server";
 import auth from "./routes/auth.js";
@@ -7,9 +7,11 @@ import stripe from "./routes/stripe.js";
 import revenuecat from "./routes/revenuecat.js";
 import { resolveQuery, ensureHookForCachedWord } from "./lib/resolveQuery.js";
 import { getSupabase } from "./lib/supabase.js";
-import { generateTTS, generateTTSInstructions, generatePhraseTTS, generatePhraseHeadwordTTS, generateWordExampleTTS } from "./lib/generateTTS.js";
+import { generatePhraseTTS, generatePhraseHeadwordTTS, generateWordExampleTTS } from "./lib/generateTTS.js";
 import { fetchOxfordAudioUrl } from "./lib/fetchOxfordAudio.js";
 import { rateLimit } from "./lib/rateLimit.js";
+import { OxfordBudgetExceededError, getOxfordUsage } from "./lib/oxfordGuard.js";
+import { updateDictionaryCachePayload } from "./lib/dictionaryCache.js";
 
 const app = new Hono();
 
@@ -52,16 +54,31 @@ app.route("/revenuecat", revenuecat);
 /* =========================
  * 4. resolveQuery
  * ========================= */
-app.post("/resolve", rateLimit, async (c) => {
+/**
+ * GET と POST で同じ処理を共有する。
+ * GET を用意しているのは、Next.js の Data Cache が GET しか載せないため。
+ * SSR から POST で叩くとページ表示のたびに毎回ここへ来る。
+ */
+async function handleResolve(c: Context, query: string) {
   try {
-    const body = await c.req.json()
-    const query = typeof body?.query === "string" ? body.query.trim() : ""
     if (!query || query.length > 100) {
       return c.json({ ok: false, reason: "INVALID_QUERY" }, 400)
     }
     const result = await resolveQuery(query)
     return c.json(result)
   } catch (error) {
+    // 月次コール上限に達した。キャッシュ済みの語は通常どおり返るため、
+    // ここに来るのはキャッシュに無い語だけ。
+    if (error instanceof OxfordBudgetExceededError) {
+      console.error(
+        "RESOLVE BLOCKED BY BUDGET:",
+        error.used,
+        "/",
+        error.limit
+      )
+      return c.json({ ok: false, reason: "UNAVAILABLE" }, 503)
+    }
+
     if (
       error instanceof Error &&
       error.name === "OxfordUsageLimitError"
@@ -84,6 +101,28 @@ app.post("/resolve", rateLimit, async (c) => {
       },
       500
     )
+  }
+}
+
+app.post("/resolve", rateLimit, async (c) => {
+  const body = await c.req.json().catch(() => ({}))
+  const query = typeof body?.query === "string" ? body.query.trim() : ""
+  return handleResolve(c, query)
+})
+
+app.get("/resolve", rateLimit, async (c) => {
+  const raw = c.req.query("query")
+  const query = typeof raw === "string" ? raw.trim() : ""
+  return handleResolve(c, query)
+})
+
+// 使用状況の確認用。ダッシュボードを開かずに現在値を取れるようにする。
+app.get("/oxford/usage", async (c) => {
+  try {
+    return c.json({ ok: true, ...(await getOxfordUsage()) })
+  } catch (error) {
+    console.error("OXFORD USAGE HANDLER FAILED:", error)
+    return c.json({ ok: false, reason: "INTERNAL_ERROR" }, 500)
   }
 })
 
@@ -133,7 +172,6 @@ app.post("/audio", rateLimit, async (c) => {
       ttsInstructions?: string
       [key: string]: unknown
     }
-    let cachedPayload: CachePayload | null = null
 
     if (wordRow?.id) {
       const { data: cached } = await supabase
@@ -142,7 +180,7 @@ app.post("/audio", rateLimit, async (c) => {
         .eq("word_id", wordRow.id)
         .maybeSingle()
 
-      cachedPayload = (cached?.payload as CachePayload) ?? null
+      const cachedPayload = (cached?.payload as CachePayload) ?? null
 
       // Oxford の公式音声 URL が最優先
       if (cachedPayload?.audio?.audioUrl) {
@@ -159,41 +197,21 @@ app.post("/audio", rateLimit, async (c) => {
       // 実際に音声が鳴らされる単語だけがコスト対象になる（節約）。
       const backfilledUrl = await fetchOxfordAudioUrl(word)
       if (backfilledUrl) {
-        const nextPayload: CachePayload = { ...(cachedPayload ?? {}), audio: { audioUrl: backfilledUrl } }
-        await supabase
-          .from("dictionary_cache")
-          .upsert(
-            { word_id: wordRow.id, payload: nextPayload },
-            { onConflict: "word_id" },
-          )
+        // 書き込む直前に最新の payload を再読込して該当キーだけ更新する。
+        // 例文音声の並列生成などで payload が別途更新されていても潰さない。
+        await updateDictionaryCachePayload(wordRow.id, (latest) => ({
+          ...(latest ?? {}),
+          audio: { audioUrl: backfilledUrl },
+        }))
         return c.json({ ok: true, audioUrl: backfilledUrl })
       }
     }
 
-    // 発音 instructions を用意（キャッシュ優先・なければ IPA から生成）
-    let instructions = cachedPayload?.ttsInstructions
-    if (!instructions && cachedPayload?.ipa) {
-      instructions = await generateTTSInstructions(word, cachedPayload.ipa)
-    }
-
-    const audioPath = await generateTTS(word, instructions)
-    if (!audioPath) return c.json({ ok: false, reason: "TTS_FAILED" }, 500)
-
-    // payloadに保存（audio + ttsInstructions を同時に）
-    if (wordRow?.id) {
-      const nextPayload: CachePayload = { ...(cachedPayload ?? {}), audio: { audioPath } }
-      if (instructions) nextPayload.ttsInstructions = instructions
-      await supabase
-        .from("dictionary_cache")
-        .upsert(
-          { word_id: wordRow.id, payload: nextPayload },
-          { onConflict: "word_id" },
-        )
-    }
-
-    const supabaseUrl = process.env.SUPABASE_URL!
-    const audioUrl = `${supabaseUrl}/storage/v1/object/public/${audioPath}`
-    return c.json({ ok: true, audioUrl })
+    // 見出し語の発音は Oxford の実録音のみ。OpenAI TTS にはフォールバックしない。
+    // 2026-09-16 に Oxford 停止中に OpenAI が「rhymes with 'X'」の instructions で
+    // 誤った音を生成し、dictionary_cache を上書きした事故があった。
+    // 呼び出し側は NO_AUDIO を受けてボタンを無効化する等の扱いにする。
+    return c.json({ ok: false, reason: "NO_AUDIO" }, 404)
   } catch (error) {
     console.error("AUDIO HANDLER FAILED:", error)
     return c.json({ ok: false, reason: "INTERNAL_ERROR" }, 500)
@@ -270,14 +288,13 @@ app.post("/audio/word/example", async (c) => {
     const audioPath = await generateWordExampleTTS(senseId, exampleText)
     if (!audioPath) return c.json({ ok: false, reason: "TTS_FAILED" }, 500)
 
-    const nextAudioMap: SenseAudioMap = {
-      ...(payload.senseAudioPaths ?? {}),
-      [senseId]: audioPath,
-    }
-    await supabase
-      .from("dictionary_cache")
-      .update({ payload: { ...payload, senseAudioPaths: nextAudioMap } })
-      .eq("word_id", wordRow.id)
+    // 書き込む直前に最新 payload を再読込して senseAudioPaths[senseId] だけ更新する。
+    // /audio 側で更新された audio / ttsInstructions を上書きしない。
+    await updateDictionaryCachePayload(wordRow.id, (latest) => {
+      const latestMap = (latest?.senseAudioPaths as SenseAudioMap | undefined) ?? {}
+      const nextMap: SenseAudioMap = { ...latestMap, [senseId]: audioPath }
+      return { ...(latest ?? {}), senseAudioPaths: nextMap }
+    })
 
     const audioUrl = `${supabaseUrl}/storage/v1/object/public/${audioPath}`
     return c.json({ ok: true, audioUrl })

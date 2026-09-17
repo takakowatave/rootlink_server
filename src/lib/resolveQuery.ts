@@ -12,6 +12,14 @@ import { generateSensesAI } from "./generateSensesAI.js"
 import { rerankSensesForLearners } from "./rerankSensesForLearners.js"
 import { regenerateMissingExamples } from "./rewriteDictionaryAI.js"
 import { generateHookForDictionary } from "./generateHookAI.js"
+import {
+  withOxfordBudget,
+  getNegativeEntry,
+  saveNegativeEntry,
+  bumpNegativeHit,
+  OxfordBudgetExceededError,
+} from "./oxfordGuard.js"
+import { updateDictionaryCachePayload, AUDIO_PRESERVED_KEYS } from "./dictionaryCache.js"
 
 /**
  * resolveQuery.ts
@@ -143,18 +151,39 @@ async function correctSpelling(word: string): Promise<string | null> {
    Oxford API
 ========================= */
 
+/**
+ * entries 取得の結果。
+ * "not_found" は Oxford に見出しが無いことが確定した状態（ネガティブキャッシュ可）。
+ * "error" は通信・サーバー側の一過性障害（ネガティブキャッシュ不可）。
+ */
+type EntriesResult =
+  | { status: "ok"; json: unknown }
+  | { status: "not_found" }
+  | { status: "error" }
+
 /** entries を取得する。Oxford raw は保存せず、正規化処理へ渡す。 */
-async function fetchEntries(word: string): Promise<unknown | null> {
+async function fetchEntries(word: string): Promise<EntriesResult> {
   console.log("OXFORD ENTRIES START:", word)
 
   const url = `${BASE_URL}/entries/en-gb/${encodeURIComponent(word)}`
-  const res = await fetch(url, {
-    headers: {
-      app_id: process.env.OXFORD_APP_ID ?? "",
-      app_key: process.env.OXFORD_APP_KEY ?? "",
-    },
-    cache: "no-store",
-  })
+
+  let res: Response
+  try {
+    res = await withOxfordBudget(() =>
+      fetch(url, {
+        headers: {
+          app_id: process.env.OXFORD_APP_ID ?? "",
+          app_key: process.env.OXFORD_APP_KEY ?? "",
+        },
+        cache: "no-store",
+      })
+    )
+  } catch (error) {
+    // 上限超過は呼び出し側まで伝播させる（キャッシュのみで応答させるため）。
+    if (error instanceof OxfordBudgetExceededError) throw error
+    console.error("OXFORD ENTRIES THREW:", word, error)
+    return { status: "error" }
+  }
 
   console.log("OXFORD ENTRIES STATUS:", word, res.status)
 
@@ -170,28 +199,42 @@ async function fetchEntries(word: string): Promise<unknown | null> {
       throw new OxfordUsageLimitError()
     }
 
-    return null
+    // 404 のみ「この語は存在しない」と確定できる。
+    // 5xx / ネットワーク由来は一過性なので確定扱いにしない。
+    if (res.status === 404) return { status: "not_found" }
+
+    return { status: "error" }
   }
 
   const json = await res.json()
   console.log("OXFORD ENTRIES OK:", word)
-  return json
+  return { status: "ok", json }
 }
 
 /** inflections API から活用形だけを抽出して返す。 */
 async function fetchInflections(word: string): Promise<string[]> {
   console.log("OXFORD INFLECTIONS:", word)
 
-  const res = await fetch(
-    `${BASE_URL}/inflections/en-gb/${encodeURIComponent(word)}`,
-    {
-      headers: {
-        app_id: process.env.OXFORD_APP_ID ?? "",
-        app_key: process.env.OXFORD_APP_KEY ?? "",
-      },
-      cache: "no-store",
+  let res: Response
+  try {
+    res = await withOxfordBudget(() =>
+      fetch(`${BASE_URL}/inflections/en-gb/${encodeURIComponent(word)}`, {
+        headers: {
+          app_id: process.env.OXFORD_APP_ID ?? "",
+          app_key: process.env.OXFORD_APP_KEY ?? "",
+        },
+        cache: "no-store",
+      })
+    )
+  } catch (error) {
+    // 活用形は無くても辞書は組める。上限超過でも検索自体は続行させる。
+    if (error instanceof OxfordBudgetExceededError) {
+      console.warn("OXFORD INFLECTIONS SKIPPED (budget):", word)
+      return []
     }
-  )
+    console.error("OXFORD INFLECTIONS THREW:", word, error)
+    return []
+  }
 
   if (!res.ok) return []
 
@@ -386,21 +429,34 @@ async function getCachedDictionary(
   return row.payload as RewrittenDictionary
 }
 
-/** 完成済み payload だけを保存する。 */
+/** 完成済み payload だけを保存する。
+ *
+ * 2026-09-16 事故対策: /audio と /audio/word/example が payload に
+ * 追加する audio / ttsInstructions / senseAudioPaths は、この関数の
+ * 書き込みで消えないよう、書き込む直前に最新 payload を読み直して
+ * 該当キーを引き継いだうえで upsert する。
+ */
 async function saveDictionary(
   word: string,
   payload: RewrittenDictionary
 ): Promise<void> {
-  const supabase = getSupabase()
   const wordId = await ensureWordId(word)
 
-  const { error } = await supabase.from("dictionary_cache").upsert({
-    word_id: wordId,
-    payload,
+  const { ok } = await updateDictionaryCachePayload(wordId, (latest) => {
+    const merged: Record<string, unknown> = { ...(payload as unknown as Record<string, unknown>) }
+    if (latest) {
+      for (const key of AUDIO_PRESERVED_KEYS) {
+        // 入力 payload に無く、DB 側に値があるなら維持する。
+        // 入力 payload に既にあるならそちらを尊重する（意図的な差替を許す）。
+        if (!(key in merged) && latest[key] !== undefined) {
+          merged[key] = latest[key]
+        }
+      }
+    }
+    return merged
   })
-
-  if (error) {
-    throw error
+  if (!ok) {
+    throw new Error(`saveDictionary: failed to persist ${word}`)
   }
 
   // 語源パーツ × 単語のマッピングを蓄積
@@ -411,6 +467,7 @@ async function saveDictionary(
       .map((part_text) => ({ part_text, word: word.toLowerCase() }))
 
     if (rows.length > 0) {
+      const supabase = getSupabase()
       await supabase
         .from("etymology_part_words")
         .upsert(rows, { onConflict: "part_text,word" })
@@ -716,26 +773,47 @@ async function buildNormalizedDictionary(candidate: string, entries: unknown) {
   return normalized
 }
 
+type CandidateResolution = {
+  result: { resolved: string; dictionary: RewrittenDictionary } | null
+  /**
+   * 一過性エラー（5xx・通信断）が混ざったか。
+   * true のときは「この語は存在しない」と確定できないのでネガティブキャッシュに書かない。
+   */
+  transientError: boolean
+}
+
 /** 候補を順に調べ、cache hit なら返し、miss なら Oxford -> normalize -> rewrite -> 保存する。 */
 async function resolveFromCandidates(
   candidates: string[]
-): Promise<{ resolved: string; dictionary: RewrittenDictionary } | null> {
+): Promise<CandidateResolution> {
+  let transientError = false
+
   for (const candidate of candidates) {
     const cached = await getCachedDictionary(candidate)
 
     if (cached) {
       console.log("DICTIONARY CACHE HIT:", candidate)
       const hydrated = await hydrateFromCache(candidate, cached)
-      return { resolved: candidate, dictionary: hydrated }
+      return { result: { resolved: candidate, dictionary: hydrated }, transientError }
     }
 
     console.log("DICTIONARY CACHE MISS:", candidate)
 
-    const entries = await fetchEntries(candidate)
-    if (!entries) {
+    const entriesResult = await fetchEntries(candidate)
+
+    if (entriesResult.status === "error") {
+      // 一過性障害。存在しないと断定できないので記録して次へ。
+      console.warn("OXFORD ENTRIES TRANSIENT ERROR:", candidate)
+      transientError = true
+      continue
+    }
+
+    if (entriesResult.status === "not_found") {
       console.log("OXFORD NO ENTRIES:", candidate)
       continue
     }
+
+    const entries = entriesResult.json
 
     // Oxford が返した実headwordを確認する（"regimented" → "regiment" のようなケース）
     const headword = extractHeadword(entries) ?? candidate
@@ -748,7 +826,7 @@ async function resolveFromCandidates(
       if (candidateCached) {
         console.log("DICTIONARY CACHE HIT BY CANDIDATE:", candidate)
         const hydrated = await hydrateFromCache(candidate, candidateCached)
-        return { resolved: candidate, dictionary: hydrated }
+        return { result: { resolved: candidate, dictionary: hydrated }, transientError }
       }
       // headword 側にキャッシュがあっても candidate で別途保存する（後述）
     }
@@ -759,7 +837,7 @@ async function resolveFromCandidates(
       if (cached) {
         console.log("DICTIONARY CACHE HIT BY HEADWORD:", headword)
         const hydrated = await hydrateFromCache(headword, cached)
-        return { resolved: headword, dictionary: hydrated }
+        return { result: { resolved: headword, dictionary: hydrated }, transientError }
       }
     }
 
@@ -783,10 +861,10 @@ async function resolveFromCandidates(
     await saveDictionary(candidate, dictionary)
     console.log("DICTIONARY CACHE SAVED:", candidate)
 
-    return { resolved: candidate, dictionary }
+    return { result: { resolved: candidate, dictionary }, transientError }
   }
 
-  return null
+  return { result: null, transientError }
 }
 
 /* =========================
@@ -814,6 +892,40 @@ async function resolveQueryInternal(raw: string): Promise<ResolveResult> {
 
     const input = raw.trim().toLowerCase()
 
+    // 直近に「該当なし」と確定した入力は、Oxford も OpenAI も叩かずに即返す。
+    // ここが無いと、存在しない語がアクセスのたびに従量課金される。
+    const negative = await getNegativeEntry(input)
+    if (negative) {
+      void bumpNegativeHit(input)
+
+      if (negative.outcome === "no_result") {
+        console.log("NEGATIVE CACHE HIT (no_result):", input)
+        return { ok: false, reason: "NO_RESULT" }
+      }
+
+      if (negative.outcome === "corrected" && negative.resolvedTo) {
+        const cached = await getCachedDictionary(negative.resolvedTo)
+        if (cached) {
+          console.log(
+            "NEGATIVE CACHE HIT (corrected):",
+            input,
+            "->",
+            negative.resolvedTo
+          )
+          const hydrated = await hydrateFromCache(negative.resolvedTo, cached)
+          return {
+            ok: true,
+            resolved: negative.resolvedTo,
+            changed: true,
+            redirectTo: `/word/${negative.resolvedTo}`,
+            dictionary: hydrated,
+            correctedFrom: input,
+          }
+        }
+        // 補正先のキャッシュが消えている場合のみ通常フローへ落とす。
+      }
+    }
+
     // クエリされた原形を最優先で試す。Oxford に独立した見出しがある語
     // （pleading / meeting / building など、-ing/-ed 形が名詞・形容詞でもある語）は
     // その形のまま解決し、固有の品詞・語義を保持する。
@@ -826,13 +938,13 @@ async function resolveQueryInternal(raw: string): Promise<ResolveResult> {
 
     const direct = await resolveFromCandidates(candidates)
 
-    if (direct) {
+    if (direct.result) {
       return {
         ok: true,
-        resolved: direct.resolved,
-        changed: direct.resolved !== input,
-        redirectTo: `/word/${direct.resolved}`,
-        dictionary: direct.dictionary,
+        resolved: direct.result.resolved,
+        changed: direct.result.resolved !== input,
+        redirectTo: `/word/${direct.result.resolved}`,
+        dictionary: direct.result.dictionary,
       }
     }
 
@@ -862,21 +974,38 @@ async function resolveQueryInternal(raw: string): Promise<ResolveResult> {
       return null
     })
 
+    let correctionTransientError = false
+
     if (corrected && corrected !== input) {
       console.log("SPELL CORRECTED:", input, "->", corrected)
       const correctedCandidates = buildLookupCandidates(corrected)
       const correctedResult = await resolveFromCandidates(correctedCandidates)
+      correctionTransientError = correctedResult.transientError
 
-      if (correctedResult) {
+      if (correctedResult.result) {
+        // 次回から OpenAI のスペル補正を省けるよう、入力 -> 補正先を記録する。
+        await saveNegativeEntry(
+          input,
+          "corrected",
+          correctedResult.result.resolved
+        )
+
         return {
           ok: true,
-          resolved: correctedResult.resolved,
+          resolved: correctedResult.result.resolved,
           changed: true,
-          redirectTo: `/word/${correctedResult.resolved}`,
-          dictionary: correctedResult.dictionary,
+          redirectTo: `/word/${correctedResult.result.resolved}`,
+          dictionary: correctedResult.result.dictionary,
           correctedFrom: input,
         }
       }
+    }
+
+    // 一過性エラーが混ざっていた場合は「存在しない」と確定できないので記録しない。
+    if (!direct.transientError && !correctionTransientError) {
+      await saveNegativeEntry(input, "no_result")
+    } else {
+      console.warn("NEGATIVE CACHE SKIPPED (transient error):", input)
     }
 
     return { ok: false, reason: "NO_RESULT" }

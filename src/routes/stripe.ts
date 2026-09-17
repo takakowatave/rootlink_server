@@ -150,11 +150,16 @@ router.post("/webhook", async (c) => {
         const subscriptionId = session.subscription as string
         let plan: PlanName = "monthly"
         let status: string = "active"
+        let expiresAt: string | null = null
 
         if (subscriptionId) {
           const sub = await stripe.subscriptions.retrieve(subscriptionId)
           plan = planFromSubscription(sub) ?? (session.metadata?.plan as PlanName) ?? "monthly"
           status = sub.status
+          const periodEnd = sub.items.data[0]?.current_period_end
+          if (periodEnd) {
+            expiresAt = new Date(periodEnd * 1000).toISOString()
+          }
         }
 
         await supabase.from("subscriptions").upsert(
@@ -164,6 +169,9 @@ router.post("/webhook", async (c) => {
             stripe_subscription_id: subscriptionId,
             plan,
             status,
+            store: "stripe",
+            will_renew: true,
+            expires_at: expiresAt,
             updated_at: new Date().toISOString(),
           },
           { onConflict: "user_id" }
@@ -178,19 +186,36 @@ router.post("/webhook", async (c) => {
         const plan = planFromSubscription(sub)
 
         // Stripe の status をそのまま保存（active/trialing/past_due/canceled/...）
-        // getUserPlan 側で premium 判定（['active','trialing']）を行う
+        // getUserPlan 側で premium 判定（['active','trialing']）を行う。
+        // will_renew は cancel_at_period_end (「期間終了で解約する」チェック) と、
+        // deleted イベント (即時削除) で false になる。それ以外は true。
+        const willRenew =
+          event.type === "customer.subscription.deleted"
+            ? false
+            : !sub.cancel_at_period_end
         const update: Record<string, unknown> = {
           status: sub.status,
+          will_renew: willRenew,
           updated_at: new Date().toISOString(),
         }
         if (plan) update.plan = plan
+        const periodEnd = sub.items.data[0]?.current_period_end
+        if (periodEnd) {
+          update.expires_at = new Date(periodEnd * 1000).toISOString()
+        }
 
         await supabase
           .from("subscriptions")
           .update(update)
           .eq("stripe_subscription_id", sub.id)
 
-        console.log("SUBSCRIPTION UPDATED:", sub.id, sub.status, plan ?? "(plan unchanged)")
+        console.log(
+          "SUBSCRIPTION UPDATED:",
+          sub.id,
+          sub.status,
+          plan ?? "(plan unchanged)",
+          "will_renew=" + willRenew
+        )
         break
       }
 

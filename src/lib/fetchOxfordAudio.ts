@@ -4,6 +4,8 @@
  * Oxford が返す最初の pronunciation.audioFile を返す。無ければ null。
  */
 
+import { withOxfordBudget, OxfordBudgetExceededError } from "./oxfordGuard.js"
+
 const BASE_URL = "https://od-api.oxforddictionaries.com/api/v2"
 
 export async function fetchOxfordAudioUrl(word: string): Promise<string | null> {
@@ -13,10 +15,27 @@ export async function fetchOxfordAudioUrl(word: string): Promise<string | null> 
 
   try {
     const url = `${BASE_URL}/entries/en-gb/${encodeURIComponent(word)}`
-    const res = await fetch(url, {
-      headers: { app_id: appId, app_key: appKey },
-      cache: "no-store",
-    })
+
+    // 上限ガードを通す。ここを通さないと、音声再生ぶんのコールが
+    // カウントにも上限にも掛からず、請求まで誰も気づけない。
+    let res: Response
+    try {
+      res = await withOxfordBudget(() =>
+        fetch(url, {
+          headers: { app_id: appId, app_key: appKey },
+          cache: "no-store",
+        })
+      )
+    } catch (error) {
+      if (error instanceof OxfordBudgetExceededError) {
+        // 上限超過。呼び出し側は OpenAI TTS にフォールバックするので
+        // 音声そのものは止まらない。
+        console.warn("OXFORD AUDIO SKIPPED (budget):", word)
+        return null
+      }
+      throw error
+    }
+
     if (!res.ok) return null
 
     const data = (await res.json()) as unknown
