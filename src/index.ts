@@ -7,7 +7,7 @@ import stripe from "./routes/stripe.js";
 import revenuecat from "./routes/revenuecat.js";
 import { resolveQuery, ensureHookForCachedWord } from "./lib/resolveQuery.js";
 import { getSupabase } from "./lib/supabase.js";
-import { generateTTS, generateTTSInstructions, generatePhraseTTS, generatePhraseHeadwordTTS, generateWordExampleTTS } from "./lib/generateTTS.js";
+import { generatePhraseTTS, generatePhraseHeadwordTTS, generateWordExampleTTS } from "./lib/generateTTS.js";
 import { fetchOxfordAudioUrl } from "./lib/fetchOxfordAudio.js";
 import { rateLimit } from "./lib/rateLimit.js";
 import { OxfordBudgetExceededError, getOxfordUsage } from "./lib/oxfordGuard.js";
@@ -172,7 +172,6 @@ app.post("/audio", rateLimit, async (c) => {
       ttsInstructions?: string
       [key: string]: unknown
     }
-    let cachedPayload: CachePayload | null = null
 
     if (wordRow?.id) {
       const { data: cached } = await supabase
@@ -181,7 +180,7 @@ app.post("/audio", rateLimit, async (c) => {
         .eq("word_id", wordRow.id)
         .maybeSingle()
 
-      cachedPayload = (cached?.payload as CachePayload) ?? null
+      const cachedPayload = (cached?.payload as CachePayload) ?? null
 
       // Oxford の公式音声 URL が最優先
       if (cachedPayload?.audio?.audioUrl) {
@@ -208,28 +207,11 @@ app.post("/audio", rateLimit, async (c) => {
       }
     }
 
-    // 発音 instructions を用意（キャッシュ優先・なければ IPA から生成）
-    let instructions = cachedPayload?.ttsInstructions
-    if (!instructions && cachedPayload?.ipa) {
-      instructions = await generateTTSInstructions(word, cachedPayload.ipa)
-    }
-
-    const audioPath = await generateTTS(word, instructions)
-    if (!audioPath) return c.json({ ok: false, reason: "TTS_FAILED" }, 500)
-
-    // payloadに保存（audio + ttsInstructions を同時に）。
-    // 直前スナップショットで丸上書きせず、最新を読み直して該当キーのみ patch する。
-    if (wordRow?.id) {
-      await updateDictionaryCachePayload(wordRow.id, (latest) => {
-        const next: CachePayload = { ...(latest ?? {}), audio: { audioPath } }
-        if (instructions) next.ttsInstructions = instructions
-        return next
-      })
-    }
-
-    const supabaseUrl = process.env.SUPABASE_URL!
-    const audioUrl = `${supabaseUrl}/storage/v1/object/public/${audioPath}`
-    return c.json({ ok: true, audioUrl })
+    // 見出し語の発音は Oxford の実録音のみ。OpenAI TTS にはフォールバックしない。
+    // 2026-09-16 に Oxford 停止中に OpenAI が「rhymes with 'X'」の instructions で
+    // 誤った音を生成し、dictionary_cache を上書きした事故があった。
+    // 呼び出し側は NO_AUDIO を受けてボタンを無効化する等の扱いにする。
+    return c.json({ ok: false, reason: "NO_AUDIO" }, 404)
   } catch (error) {
     console.error("AUDIO HANDLER FAILED:", error)
     return c.json({ ok: false, reason: "INTERNAL_ERROR" }, 500)
