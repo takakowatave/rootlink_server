@@ -7,7 +7,7 @@ import stripe from "./routes/stripe.js";
 import revenuecat from "./routes/revenuecat.js";
 import { resolveQuery, ensureHookForCachedWord } from "./lib/resolveQuery.js";
 import { getSupabase } from "./lib/supabase.js";
-import { generatePhraseTTS, generatePhraseHeadwordTTS, generateWordExampleTTS } from "./lib/generateTTS.js";
+import { generateTTS, generatePhraseTTS, generatePhraseHeadwordTTS, generateWordExampleTTS } from "./lib/generateTTS.js";
 import { fetchOxfordAudioUrl } from "./lib/fetchOxfordAudio.js";
 import { rateLimit } from "./lib/rateLimit.js";
 import { OxfordBudgetExceededError, getOxfordUsage } from "./lib/oxfordGuard.js";
@@ -195,22 +195,42 @@ app.post("/audio", rateLimit, async (c) => {
 
       // Lazy backfill: 既存 cache に audio が入っていなくても、Oxford URL を1回取りに行って保存する。
       // 実際に音声が鳴らされる単語だけがコスト対象になる（節約）。
-      const backfilledUrl = await fetchOxfordAudioUrl(word)
-      if (backfilledUrl) {
-        // 書き込む直前に最新の payload を再読込して該当キーだけ更新する。
-        // 例文音声の並列生成などで payload が別途更新されていても潰さない。
+      const oxford = await fetchOxfordAudioUrl(word)
+      if (oxford.status === "found") {
         await updateDictionaryCachePayload(wordRow.id, (latest) => ({
           ...(latest ?? {}),
-          audio: { audioUrl: backfilledUrl },
+          audio: { audioUrl: oxford.audioUrl },
         }))
-        return c.json({ ok: true, audioUrl: backfilledUrl })
+        return c.json({ ok: true, audioUrl: oxford.audioUrl })
       }
+
+      // Oxford に音声が確定的に無い語 ("paster" のような派生形など) は
+      // OpenAI TTS でフォールバックする。GENERIC_WORD_INSTRUCTIONS のみを
+      // 使い、IPA 由来の instructions は渡さない。
+      // 2026-09-16 事故は cache 内の ttsInstructions ("rhymes with X") が
+      // TTS に別語を読ませたのが原因。ここでは instructions を保存せず、
+      // 単語自身だけを input にして "この英単語を英国発音で" とだけ命じる。
+      // Oxford が一時的失敗 (transient) の時は絶対にフォールバックしない。
+      // Oxford 復活時に本物の音声が取れる可能性を潰さないため。
+      if (oxford.status === "no_audio") {
+        const audioPath = await generateTTS(word)
+        if (!audioPath) return c.json({ ok: false, reason: "TTS_FAILED" }, 500)
+        await updateDictionaryCachePayload(wordRow.id, (latest) => ({
+          ...(latest ?? {}),
+          audio: { audioPath },
+        }))
+        const supabaseUrl = process.env.SUPABASE_URL!
+        const audioUrl = `${supabaseUrl}/storage/v1/object/public/${audioPath}`
+        return c.json({ ok: true, audioUrl })
+      }
+
+      // transient: Oxford が一時的にコケた / rate limit / budget 超過。
+      // 呼び出し側は NO_AUDIO と違って retry-able に扱えるよう別 reason で返す。
+      return c.json({ ok: false, reason: "UPSTREAM_FAIL" }, 503)
     }
 
-    // 見出し語の発音は Oxford の実録音のみ。OpenAI TTS にはフォールバックしない。
-    // 2026-09-16 に Oxford 停止中に OpenAI が「rhymes with 'X'」の instructions で
-    // 誤った音を生成し、dictionary_cache を上書きした事故があった。
-    // 呼び出し側は NO_AUDIO を受けてボタンを無効化する等の扱いにする。
+    // words 表に見出しが無い (dictionary_cache も無い) 状態で /audio を叩かれた
+    // ケース。/resolve が先に走っていないと基本ここには来ない。念のため NO_AUDIO で返す。
     return c.json({ ok: false, reason: "NO_AUDIO" }, 404)
   } catch (error) {
     console.error("AUDIO HANDLER FAILED:", error)
