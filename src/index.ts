@@ -12,6 +12,7 @@ import { fetchOxfordAudioUrl } from "./lib/fetchOxfordAudio.js";
 import { rateLimit } from "./lib/rateLimit.js";
 import { OxfordBudgetExceededError, getOxfordUsage } from "./lib/oxfordGuard.js";
 import { updateDictionaryCachePayload } from "./lib/dictionaryCache.js";
+import { sendEmail, renderReportEmail } from "./lib/sendEmail.js";
 
 const app = new Hono();
 
@@ -420,6 +421,78 @@ app.post("/audio/phrase/headword", async (c) => {
     return c.json({ ok: true, audioUrl })
   } catch (error) {
     console.error("AUDIO PHRASE HEADWORD HANDLER FAILED:", error)
+    return c.json({ ok: false, reason: "INTERNAL_ERROR" }, 500)
+  }
+})
+
+/* =========================
+ * 5c. Content report (word / phrase)
+ * ========================= */
+/**
+ * ユーザーからの「この単語/フレーズの内容が変」報告を受けて、Resend 経由で
+ * kiko の受信箱にメール転送する。DB には保存しない (件数が増えるまでは
+ * メール受信箱で十分)。
+ *
+ * - 認証は任意。Bearer token があれば reporter email / user_id を添える。
+ * - rate limit で1IPあたりの連投を抑える。
+ * - 宛先は REPORT_EMAIL_TO env で切り替え可能。未設定なら kiko の Gmail 直送。
+ */
+app.post("/report", rateLimit, async (c) => {
+  try {
+    const body = await c.req.json().catch(() => ({} as Record<string, unknown>))
+    const kind = body?.kind
+    const content = typeof body?.content === "string" ? body.content.trim() : ""
+    const reason = typeof body?.reason === "string" ? body.reason.trim() : ""
+    const message = typeof body?.message === "string" ? body.message.trim() : ""
+    const pageUrl = typeof body?.pageUrl === "string" ? body.pageUrl.trim() : ""
+
+    if (kind !== "word" && kind !== "phrase") {
+      return c.json({ ok: false, reason: "INVALID_KIND" }, 400)
+    }
+    if (!content || content.length > 200) {
+      return c.json({ ok: false, reason: "INVALID_CONTENT" }, 400)
+    }
+    if (!reason || reason.length > 100) {
+      return c.json({ ok: false, reason: "INVALID_REASON" }, 400)
+    }
+    if (message.length > 2000) {
+      return c.json({ ok: false, reason: "MESSAGE_TOO_LONG" }, 400)
+    }
+
+    // 認証は任意。あれば email を添える。無くても受け付ける (匿名報告)。
+    let reporterEmail: string | null = null
+    let userId: string | null = null
+    const token = c.req.header("Authorization")?.replace("Bearer ", "")
+    if (token) {
+      try {
+        const supabase = getSupabase()
+        const { data } = await supabase.auth.getUser(token)
+        if (data?.user) {
+          reporterEmail = data.user.email ?? null
+          userId = data.user.id
+        }
+      } catch (err) {
+        console.warn("report: user lookup failed (ignored)", err)
+      }
+    }
+
+    const to = process.env.REPORT_EMAIL_TO ?? "kikotkk@gmail.com"
+    const email = renderReportEmail({
+      kind,
+      content,
+      reason,
+      message: message || undefined,
+      pageUrl: pageUrl || undefined,
+      reporterEmail,
+      userId,
+    })
+    const result = await sendEmail({ to, subject: email.subject, html: email.html })
+    if (!result.ok) {
+      return c.json({ ok: false, reason: "SEND_FAILED" }, 500)
+    }
+    return c.json({ ok: true })
+  } catch (error) {
+    console.error("REPORT HANDLER FAILED:", error)
     return c.json({ ok: false, reason: "INTERNAL_ERROR" }, 500)
   }
 })
