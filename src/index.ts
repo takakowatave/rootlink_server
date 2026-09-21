@@ -433,10 +433,22 @@ app.post("/audio/phrase/headword", async (c) => {
  * kiko の受信箱にメール転送する。DB には保存しない (件数が増えるまでは
  * メール受信箱で十分)。
  *
- * - 認証は任意。Bearer token があれば reporter email / user_id を添える。
- * - rate limit で1IPあたりの連投を抑える。
+ * - 認証必須。Bearer token 無し / Supabase user 引けなかった時点で 401。
+ *   匿名投稿を認めるとメール爆撃の材料になるため。
+ * - 同一 user が 1時間以内に同じ (kind, content, reason) を投げても
+ *   silent success (deduped:true) で握り潰す。
+ * - rate limit で1IPあたりの連投も追加で抑える。
  * - 宛先は REPORT_EMAIL_TO env で切り替え可能。未設定なら kiko の Gmail 直送。
  */
+const REPORT_DEDUPE_MS = 60 * 60 * 1000
+const reportDedupe = new Map<string, number>()
+setInterval(() => {
+  const now = Date.now()
+  for (const [k, expiresAt] of reportDedupe) {
+    if (now >= expiresAt) reportDedupe.delete(k)
+  }
+}, 5 * 60_000).unref?.()
+
 app.post("/report", rateLimit, async (c) => {
   try {
     const body = await c.req.json().catch(() => ({} as Record<string, unknown>))
@@ -459,22 +471,25 @@ app.post("/report", rateLimit, async (c) => {
       return c.json({ ok: false, reason: "MESSAGE_TOO_LONG" }, 400)
     }
 
-    // 認証は任意。あれば email を添える。無くても受け付ける (匿名報告)。
-    let reporterEmail: string | null = null
-    let userId: string | null = null
+    // 認証必須。ボット + 匿名メール爆撃を避けるため、Bearer が付いていて
+    // Supabase の user が引ける場合のみ受け付ける。
     const token = c.req.header("Authorization")?.replace("Bearer ", "")
-    if (token) {
-      try {
-        const supabase = getSupabase()
-        const { data } = await supabase.auth.getUser(token)
-        if (data?.user) {
-          reporterEmail = data.user.email ?? null
-          userId = data.user.id
-        }
-      } catch (err) {
-        console.warn("report: user lookup failed (ignored)", err)
-      }
+    if (!token) return c.json({ ok: false, reason: "UNAUTHORIZED" }, 401)
+
+    const supabase = getSupabase()
+    const { data: userRes } = await supabase.auth.getUser(token)
+    if (!userRes?.user) return c.json({ ok: false, reason: "UNAUTHORIZED" }, 401)
+    const reporterEmail = userRes.user.email ?? null
+    const userId = userRes.user.id
+
+    // 重複抑止: 同一 user が 1時間以内に同じ組み合わせを投げても再送しない。
+    const dedupeKey = `${userId}|${kind}|${content}|${reason}`
+    const now = Date.now()
+    const expiresAt = reportDedupe.get(dedupeKey)
+    if (expiresAt && expiresAt > now) {
+      return c.json({ ok: true, deduped: true })
     }
+    reportDedupe.set(dedupeKey, now + REPORT_DEDUPE_MS)
 
     const to = process.env.REPORT_EMAIL_TO ?? "kikotkk@gmail.com"
     const email = renderReportEmail({
