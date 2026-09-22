@@ -52,6 +52,14 @@ const PROCESS_CALL_CEILING = Number(
   process.env.OXFORD_PROCESS_CALL_CEILING ?? 2000
 )
 
+/**
+ * 緊急停止スイッチ。OXFORD_ENABLED=false を設定すると、デプロイ無しで
+ * Oxford の全コールを止められる (Cloud Run 環境変数を更新して revision 差し替え)。
+ * 目的: ボット/いたずらによる想定外の課金が始まったときに、Oxford への課金を即座に絶つ。
+ * キャッシュ済みの語は dictionary_cache から返り続けるので UX への影響は限定的。
+ */
+const OXFORD_ENABLED = process.env.OXFORD_ENABLED !== "false"
+
 /* =========================
    エラー
 ========================= */
@@ -169,6 +177,11 @@ async function notifyIfThresholdCrossed(total: number): Promise<void> {
  * 数えられないコールを撃つのが、これまでの請求の原因だったため。
  */
 export async function withOxfordBudget<T>(fn: () => Promise<T>): Promise<T> {
+  if (!OXFORD_ENABLED) {
+    console.error("OXFORD DISABLED BY ENV KILL SWITCH")
+    throw new OxfordBudgetExceededError(-1, 0)
+  }
+
   if (processCalls >= PROCESS_CALL_CEILING) {
     console.error("OXFORD PROCESS CEILING HIT:", processCalls)
     throw new OxfordBudgetExceededError(processCalls, PROCESS_CALL_CEILING)
