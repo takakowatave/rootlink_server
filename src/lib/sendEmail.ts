@@ -39,13 +39,31 @@ export async function sendEmail({ to, subject, html, from }: SendEmailArgs) {
 }
 
 type ReportEmailArgs = {
-  kind: "word" | "phrase"
+  kind: "word" | "phrase" | "deck_request"
   content: string
   reason: string
   message?: string
   pageUrl?: string
   reporterEmail?: string | null
   userId?: string | null
+}
+
+const KIND_LABEL: Record<ReportEmailArgs["kind"], string> = {
+  word: "単語",
+  phrase: "フレーズ",
+  deck_request: "教材リクエスト",
+}
+
+const SUBJECT_PREFIX: Record<ReportEmailArgs["kind"], string> = {
+  word: "[RootLink 報告]",
+  phrase: "[RootLink 報告]",
+  deck_request: "[RootLink リクエスト]",
+}
+
+const HEADER_TITLE: Record<ReportEmailArgs["kind"], string> = {
+  word: "単語報告が届きました",
+  phrase: "フレーズ報告が届きました",
+  deck_request: "教材リクエストが届きました",
 }
 
 function escapeHtml(s: string): string {
@@ -58,8 +76,8 @@ function escapeHtml(s: string): string {
 }
 
 export function renderReportEmail(args: ReportEmailArgs) {
-  const kindLabel = args.kind === "word" ? "単語" : "フレーズ"
-  const subject = `[RootLink 報告] ${kindLabel}: ${args.content} (${args.reason})`
+  const kindLabel = KIND_LABEL[args.kind]
+  const subject = `${SUBJECT_PREFIX[args.kind]} ${kindLabel}: ${args.content} (${args.reason})`
   const reporter = args.reporterEmail
     ? `${escapeHtml(args.reporterEmail)}${args.userId ? ` (user_id: ${escapeHtml(args.userId)})` : ""}`
     : "未ログイン (匿名)"
@@ -77,7 +95,7 @@ export function renderReportEmail(args: ReportEmailArgs) {
 <html>
   <body style="font-family: -apple-system, BlinkMacSystemFont, 'Helvetica Neue', sans-serif; color: #111; line-height: 1.7;">
     <div style="max-width: 560px; margin: 0 auto; padding: 32px 24px;">
-      <h2 style="font-size: 18px; margin: 0 0 16px;">${kindLabel}報告が届きました</h2>
+      <h2 style="font-size: 18px; margin: 0 0 16px;">${HEADER_TITLE[args.kind]}</h2>
       <table style="font-size: 14px; width: 100%; border-collapse: collapse;">
         <tr><td style="padding: 4px 8px 4px 0; color: #666; width: 96px;">対象</td><td>${escapeHtml(args.content)}</td></tr>
         <tr><td style="padding: 4px 8px 4px 0; color: #666;">種別</td><td>${escapeHtml(args.reason)}</td></tr>
