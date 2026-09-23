@@ -458,7 +458,7 @@ app.post("/report", rateLimit, async (c) => {
     const message = typeof body?.message === "string" ? body.message.trim() : ""
     const pageUrl = typeof body?.pageUrl === "string" ? body.pageUrl.trim() : ""
 
-    if (kind !== "word" && kind !== "phrase") {
+    if (kind !== "word" && kind !== "phrase" && kind !== "deck_request") {
       return c.json({ ok: false, reason: "INVALID_KIND" }, 400)
     }
     if (!content || content.length > 200) {
