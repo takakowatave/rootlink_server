@@ -909,8 +909,13 @@ export async function normalizeDictionary(
   // Oxford から語源文を取る
   const extractedEtymology = extractEtymology(lexicalEntries)
 
-  // Oxford に語源文がなくても memory hook 生成を止めない
-  const etymology = extractedEtymology || `from ${word}`
+  // Oxford が語源文を返さない語 (economical / electrical / electricity など、
+  // 派生語で base word 側にしか etymology が無いケース) では fallback を出さない。
+  // 以前は `from ${word}` を代入していたが、自己参照テンプレになり DB に "from economical"
+  // のような無意味なテキストが 7000 件以上蓄積した (2026-09-27 kiko 指摘)。
+  // 空文字にしておくと buildEtymologyData が origin 型で返し、UI 側は EtymologyBlock の
+  // wordFamily 継承ロジックで base word の etymology を回収する。
+  const etymology = extractedEtymology ?? ''
 
   // relatedWords 用に headword + derivatives を wordFamily として渡す
   const wordFamily = uniqueStrings([word, ...normalizedDerivatives])
