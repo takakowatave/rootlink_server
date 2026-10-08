@@ -774,7 +774,9 @@ async function buildNormalizedDictionary(candidate: string, entries: unknown) {
 }
 
 type CandidateResolution = {
-  result: { resolved: string; dictionary: RewrittenDictionary } | null
+  // cached: true は dictionary_cache から返した = Oxford/OpenAI を今回叩いていない。
+  // /resolve 側で quota カウント対象かどうかを判定するために外に出す。
+  result: { resolved: string; dictionary: RewrittenDictionary; cached: boolean } | null
   /**
    * 一過性エラー（5xx・通信断）が混ざったか。
    * true のときは「この語は存在しない」と確定できないのでネガティブキャッシュに書かない。
@@ -794,7 +796,7 @@ async function resolveFromCandidates(
     if (cached) {
       console.log("DICTIONARY CACHE HIT:", candidate)
       const hydrated = await hydrateFromCache(candidate, cached)
-      return { result: { resolved: candidate, dictionary: hydrated }, transientError }
+      return { result: { resolved: candidate, dictionary: hydrated, cached: true }, transientError }
     }
 
     console.log("DICTIONARY CACHE MISS:", candidate)
@@ -826,18 +828,18 @@ async function resolveFromCandidates(
       if (candidateCached) {
         console.log("DICTIONARY CACHE HIT BY CANDIDATE:", candidate)
         const hydrated = await hydrateFromCache(candidate, candidateCached)
-        return { result: { resolved: candidate, dictionary: hydrated }, transientError }
+        return { result: { resolved: candidate, dictionary: hydrated, cached: true }, transientError }
       }
       // headword 側にキャッシュがあっても candidate で別途保存する（後述）
     }
 
     // headword 側のキャッシュ確認（headword == candidate の場合はここで return）
     if (headword === candidate) {
-      const cached = await getCachedDictionary(headword)
-      if (cached) {
+      const cachedByHead = await getCachedDictionary(headword)
+      if (cachedByHead) {
         console.log("DICTIONARY CACHE HIT BY HEADWORD:", headword)
-        const hydrated = await hydrateFromCache(headword, cached)
-        return { result: { resolved: headword, dictionary: hydrated }, transientError }
+        const hydrated = await hydrateFromCache(headword, cachedByHead)
+        return { result: { resolved: headword, dictionary: hydrated, cached: true }, transientError }
       }
     }
 
@@ -861,7 +863,7 @@ async function resolveFromCandidates(
     await saveDictionary(candidate, dictionary)
     console.log("DICTIONARY CACHE SAVED:", candidate)
 
-    return { result: { resolved: candidate, dictionary }, transientError }
+    return { result: { resolved: candidate, dictionary, cached: false }, transientError }
   }
 
   return { result: null, transientError }
@@ -879,10 +881,14 @@ export type ResolveResult =
       redirectTo: string
       dictionary: RewrittenDictionary
       correctedFrom?: string
+      // true: dictionary_cache (or negative cache) から返した = 今回 Oxford/OpenAI を叩いていない。
+      // /resolve ハンドラで quota 対象判定に使う。
+      cached: boolean
     }
   | {
       ok: false
       reason: "NO_RESULT"
+      cached: boolean
     }
 
 /** 検索本体。exact/headword -> suggestion の順で解決する。 */
@@ -900,7 +906,7 @@ async function resolveQueryInternal(raw: string): Promise<ResolveResult> {
 
       if (negative.outcome === "no_result") {
         console.log("NEGATIVE CACHE HIT (no_result):", input)
-        return { ok: false, reason: "NO_RESULT" }
+        return { ok: false, reason: "NO_RESULT", cached: true }
       }
 
       if (negative.outcome === "corrected" && negative.resolvedTo) {
@@ -920,6 +926,7 @@ async function resolveQueryInternal(raw: string): Promise<ResolveResult> {
             redirectTo: `/word/${negative.resolvedTo}`,
             dictionary: hydrated,
             correctedFrom: input,
+            cached: true,
           }
         }
         // 補正先のキャッシュが消えている場合のみ通常フローへ落とす。
@@ -945,6 +952,7 @@ async function resolveQueryInternal(raw: string): Promise<ResolveResult> {
         changed: direct.result.resolved !== input,
         redirectTo: `/word/${direct.result.resolved}`,
         dictionary: direct.result.dictionary,
+        cached: direct.result.cached,
       }
     }
 
@@ -964,6 +972,7 @@ async function resolveQueryInternal(raw: string): Promise<ResolveResult> {
         changed: byInflection.headword !== input,
         redirectTo: `/word/${byInflection.headword}`,
         dictionary: hydrated,
+        cached: true,
       }
     }
 
@@ -997,6 +1006,7 @@ async function resolveQueryInternal(raw: string): Promise<ResolveResult> {
           redirectTo: `/word/${correctedResult.result.resolved}`,
           dictionary: correctedResult.result.dictionary,
           correctedFrom: input,
+          cached: correctedResult.result.cached,
         }
       }
     }
@@ -1008,7 +1018,8 @@ async function resolveQueryInternal(raw: string): Promise<ResolveResult> {
       console.warn("NEGATIVE CACHE SKIPPED (transient error):", input)
     }
 
-    return { ok: false, reason: "NO_RESULT" }
+    // Oxford / OpenAI を実際に叩いた上で no_result 確定。quota 対象。
+    return { ok: false, reason: "NO_RESULT", cached: false }
   } catch (error) {
     if (error instanceof OxfordUsageLimitError) {
       console.error("OXFORD USAGE LIMIT EXCEEDED")

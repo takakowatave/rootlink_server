@@ -11,6 +11,12 @@ import { generateTTS, generatePhraseTTS, generatePhraseHeadwordTTS, generateWord
 import { fetchOxfordAudioUrl } from "./lib/fetchOxfordAudio.js";
 import { rateLimit } from "./lib/rateLimit.js";
 import { OxfordBudgetExceededError, getOxfordUsage } from "./lib/oxfordGuard.js";
+import {
+  DAILY_FREE_QUOTA,
+  bumpDailyNewWordCount,
+  getDailyNewWordCount,
+  isPremiumUser,
+} from "./lib/dailyNewWordQuota.js";
 import { updateDictionaryCachePayload } from "./lib/dictionaryCache.js";
 import { sendEmail, renderReportEmail } from "./lib/sendEmail.js";
 
@@ -65,7 +71,46 @@ async function handleResolve(c: Context, query: string) {
     if (!query || query.length > 100) {
       return c.json({ ok: false, reason: "INVALID_QUERY" }, 400)
     }
+
+    // Authorization: Bearer <access_token> があれば user を解決する。
+    // native の anonymous ユーザーもここに来るので「認証あり」として扱う。
+    // 未認証のまま叩く経路 (SSR / 旧ブラウザ) は IP rate limit だけで通し、quota は見ない。
+    const token = c.req.header("Authorization")?.replace("Bearer ", "")
+    let authUserId: string | null = null
+    if (token) {
+      try {
+        const { getSupabase } = await import("./lib/supabase.js")
+        const supabase = getSupabase()
+        const { data } = await supabase.auth.getUser(token)
+        authUserId = data?.user?.id ?? null
+      } catch (error) {
+        console.error("RESOLVE AUTH FAILED:", error)
+      }
+    }
+
+    // 無料ユーザーのプリチェック: 既に当日 20 回に達していれば Oxford/OpenAI を叩く前に止める。
+    // premium は無制限 (ここで false のときだけチェック)。
+    let premium = false
+    if (authUserId) {
+      premium = await isPremiumUser(authUserId)
+      if (!premium) {
+        const used = await getDailyNewWordCount(authUserId)
+        if (used >= DAILY_FREE_QUOTA) {
+          return c.json({ ok: false, reason: "QUOTA_EXCEEDED" }, 429)
+        }
+      }
+    }
+
     const result = await resolveQuery(query)
+
+    // cache miss (Oxford/OpenAI を実際に叩いた) 分だけを無料ユーザーに加算する。
+    // プリチェックですり抜けた並列ケースでは加算後に閾値を超えることがあるが、
+    // Oxford コールは既に発生しているので止められない。IP rate limit (30/min) と
+    // oxfordGuard の月次 5000 で全体ブレーキを掛けている。
+    if (authUserId && !premium && !result.cached) {
+      await bumpDailyNewWordCount(authUserId)
+    }
+
     return c.json(result)
   } catch (error) {
     // 月次コール上限に達した。キャッシュ済みの語は通常どおり返るため、
