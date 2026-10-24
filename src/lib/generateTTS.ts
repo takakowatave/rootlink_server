@@ -128,9 +128,14 @@ export async function generatePhraseTTS(
   )
 }
 
+const EXAMPLE_TTS_INSTRUCTIONS = `Read the following English sentence in a natural, clear British English accent. Speak it as a whole sentence with natural intonation and pacing — not word by word.`
+
 /**
- * 単語の sense 例文の mp3 を生成し word-audio bucket に保存する。
- * ファイル名は `example_${senseId}.mp3` 固定。既存があればスキップ。
+ * 単語の sense 例文の mp3 を legacy パス (`example_${senseId}.mp3`) に生成する。
+ * cache sense.example を読み上げるとき専用。既存があればスキップ。
+ *
+ * deck_example の override (cache と不一致) のときはこの関数は使わず、
+ * generateWordExampleTTSByText を使う。
  */
 export async function generateWordExampleTTS(
   senseId: string,
@@ -144,12 +149,38 @@ export async function generateWordExampleTTS(
     return audioPath
   }
 
-  const instructions = `Read the following English sentence in a natural, clear British English accent. Speak it as a whole sentence with natural intonation and pacing — not word by word.`
+  return withInFlight(audioPath, () =>
+    runTTS({
+      input: exampleText,
+      instructions: EXAMPLE_TTS_INSTRUCTIONS,
+      bucket: WORD_BUCKET,
+      storagePath,
+      audioPath,
+    }),
+  )
+}
+
+/**
+ * deck_words.example override のように、cache sense.example と違うテキストを読み上げるとき用。
+ * ファイル名は `example_v2_${textHash}.mp3`。同じテキストは deck をまたいで同じファイルを使い回す。
+ * 既存があればスキップ。
+ */
+export async function generateWordExampleTTSByText(
+  textHash: string,
+  exampleText: string,
+): Promise<string | null> {
+  const storagePath = `example_v2_${textHash}.mp3`
+  const audioPath = `${WORD_BUCKET}/${storagePath}`
+
+  if (await storageObjectExists(WORD_BUCKET, storagePath)) {
+    console.log("TTS SKIP (exists):", audioPath)
+    return audioPath
+  }
 
   return withInFlight(audioPath, () =>
     runTTS({
       input: exampleText,
-      instructions,
+      instructions: EXAMPLE_TTS_INSTRUCTIONS,
       bucket: WORD_BUCKET,
       storagePath,
       audioPath,
@@ -255,7 +286,7 @@ async function runTTS({ input, instructions, bucket, storagePath, audioPath }: R
  * Supabase Storage に指定パスのオブジェクトが存在するかを確認する。
  * word-audio / phrase-audio はフラットな構造で、ファイル名だけ渡す。
  */
-async function storageObjectExists(bucket: string, storagePath: string): Promise<boolean> {
+export async function storageObjectExists(bucket: string, storagePath: string): Promise<boolean> {
   try {
     const supabase = getSupabase()
     const { data, error } = await supabase.storage.from(bucket).list("", {

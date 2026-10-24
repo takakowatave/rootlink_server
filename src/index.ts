@@ -7,7 +7,19 @@ import stripe from "./routes/stripe.js";
 import revenuecat from "./routes/revenuecat.js";
 import { resolveQuery, ensureHookForCachedWord } from "./lib/resolveQuery.js";
 import { getSupabase } from "./lib/supabase.js";
-import { generateTTS, generatePhraseTTS, generatePhraseHeadwordTTS, generateWordExampleTTS } from "./lib/generateTTS.js";
+import {
+  generateTTS,
+  generatePhraseTTS,
+  generatePhraseHeadwordTTS,
+  generateWordExampleTTS,
+  generateWordExampleTTSByText,
+  storageObjectExists,
+} from "./lib/generateTTS.js";
+import {
+  hashExampleText,
+  reserveTtsCall,
+  recordTtsFailure,
+} from "./lib/ttsBudget.js";
 import { fetchOxfordAudioUrl } from "./lib/fetchOxfordAudio.js";
 import { rateLimit } from "./lib/rateLimit.js";
 import { OxfordBudgetExceededError, getOxfordUsage } from "./lib/oxfordGuard.js";
@@ -292,6 +304,10 @@ app.post("/audio/word/example", async (c) => {
     const body = await c.req.json()
     const word: string = body.word
     const senseId: string = body.sense_id
+    // optional. deck 画面経由の呼び出しでは deck_words.example 上書きがあるかもしれないので
+    // deck_id を渡してもらって解決する。/word 直検索では渡ってこない。
+    const deckId: string | undefined =
+      typeof body.deck_id === "string" && body.deck_id.length > 0 ? body.deck_id : undefined
 
     if (!word || !senseId) {
       return c.json({ ok: false, reason: "MISSING_PARAMS" }, 400)
@@ -330,37 +346,96 @@ app.post("/audio/word/example", async (c) => {
       return c.json({ ok: false, reason: "CACHE_NOT_FOUND" }, 404)
     }
 
-    const cachedPath = payload.senseAudioPaths?.[senseId]
-    if (cachedPath) {
-      const audioUrl = `${supabaseUrl}/storage/v1/object/public/${cachedPath}`
-      return c.json({ ok: true, audioUrl })
-    }
-
-    let exampleText: string | undefined
+    let cacheExample: string | undefined
     for (const group of payload.senseGroups ?? []) {
       for (const sense of group.senses ?? []) {
         if (sense.senseId === senseId && sense.example) {
-          exampleText = sense.example
+          cacheExample = sense.example
           break
         }
       }
-      if (exampleText) break
+      if (cacheExample) break
     }
 
-    if (!exampleText) {
+    // deck 画面経由なら deck_words.example の上書きがあるか確認する。
+    // クライアントから本文は受け取らず、必ず DB から引く (任意テキスト TTS 経路を作らない)。
+    let deckExample: string | undefined
+    if (deckId) {
+      const { data: deckRow } = await supabase
+        .from("deck_words")
+        .select("example, pinned_sense_id")
+        .eq("deck_id", deckId)
+        .eq("word", word)
+        .maybeSingle()
+      const row = deckRow as { example?: string | null; pinned_sense_id?: string | null } | null
+      // pinned_sense_id が未設定でも override 自体は適用する (first-sense に当たるため)。
+      // 不一致 (別の senseId がピン留めされている) なら override は使わない。
+      const senseMatches = !row?.pinned_sense_id || row.pinned_sense_id === senseId
+      if (row?.example && senseMatches) {
+        deckExample = row.example.trim()
+      }
+    }
+
+    const textToSpeak = (deckExample || cacheExample || "").trim()
+    if (!textToSpeak) {
       return c.json({ ok: false, reason: "NO_EXAMPLE" }, 400)
     }
 
-    const audioPath = await generateWordExampleTTS(senseId, exampleText)
-    if (!audioPath) return c.json({ ok: false, reason: "TTS_FAILED" }, 500)
+    const usesHashPath = Boolean(deckExample) && deckExample !== (cacheExample ?? "").trim()
+    const textHash = hashExampleText(textToSpeak)
 
-    // 書き込む直前に最新 payload を再読込して senseAudioPaths[senseId] だけ更新する。
-    // /audio 側で更新された audio / ttsInstructions を上書きしない。
-    await updateDictionaryCachePayload(wordRow.id, (latest) => {
-      const latestMap = (latest?.senseAudioPaths as SenseAudioMap | undefined) ?? {}
-      const nextMap: SenseAudioMap = { ...latestMap, [senseId]: audioPath }
-      return { ...(latest ?? {}), senseAudioPaths: nextMap }
-    })
+    // 既に Storage にあればそれを返す。budget は消費しない (OpenAI を呼ばないため)。
+    if (usesHashPath) {
+      const storagePath = `word-audio/example_v2_${textHash}.mp3`
+      if (await storageObjectExists("word-audio", `example_v2_${textHash}.mp3`)) {
+        const audioUrl = `${supabaseUrl}/storage/v1/object/public/${storagePath}`
+        return c.json({ ok: true, audioUrl })
+      }
+    } else {
+      // cache_example を読み上げるケース: legacy パスを使い回す。
+      // senseAudioPaths の shortcut が最速。無ければ Storage を直接見る。
+      const cachedPath = payload.senseAudioPaths?.[senseId]
+      if (cachedPath) {
+        const audioUrl = `${supabaseUrl}/storage/v1/object/public/${cachedPath}`
+        return c.json({ ok: true, audioUrl })
+      }
+      if (await storageObjectExists("word-audio", `example_${senseId}.mp3`)) {
+        const audioPath = `word-audio/example_${senseId}.mp3`
+        await updateDictionaryCachePayload(wordRow.id, (latest) => {
+          const latestMap = (latest?.senseAudioPaths as SenseAudioMap | undefined) ?? {}
+          const nextMap: SenseAudioMap = { ...latestMap, [senseId]: audioPath }
+          return { ...(latest ?? {}), senseAudioPaths: nextMap }
+        })
+        const audioUrl = `${supabaseUrl}/storage/v1/object/public/${audioPath}`
+        return c.json({ ok: true, audioUrl })
+      }
+    }
+
+    // ここから OpenAI TTS を叩く経路。日次 budget と失敗 cooldown をゲートで通す。
+    const decision = await reserveTtsCall("word_example", textHash)
+    if (!decision.ok) {
+      // DAILY_BUDGET_EXCEEDED / RECENT_FAILURE。クライアントは NO_AUDIO と同じに扱う。
+      return c.json({ ok: false, reason: decision.reason }, 429)
+    }
+
+    const audioPath = usesHashPath
+      ? await generateWordExampleTTSByText(textHash, textToSpeak)
+      : await generateWordExampleTTS(senseId, textToSpeak)
+
+    if (!audioPath) {
+      await recordTtsFailure(textHash, "TTS_FAILED")
+      return c.json({ ok: false, reason: "TTS_FAILED" }, 500)
+    }
+
+    // legacy パス (cache_example 読み上げ) のときだけ、senseAudioPaths shortcut を更新する。
+    // v2 パスは filename hash 自体がキーなので payload には書かない (dictionary_cache を触らない方針)。
+    if (!usesHashPath) {
+      await updateDictionaryCachePayload(wordRow.id, (latest) => {
+        const latestMap = (latest?.senseAudioPaths as SenseAudioMap | undefined) ?? {}
+        const nextMap: SenseAudioMap = { ...latestMap, [senseId]: audioPath }
+        return { ...(latest ?? {}), senseAudioPaths: nextMap }
+      })
+    }
 
     const audioUrl = `${supabaseUrl}/storage/v1/object/public/${audioPath}`
     return c.json({ ok: true, audioUrl })
