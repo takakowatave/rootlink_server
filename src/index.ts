@@ -78,6 +78,35 @@ app.route("/revenuecat", revenuecat);
  * GET を用意しているのは、Next.js の Data Cache が GET しか載せないため。
  * SSR から POST で叩くとページ表示のたびに毎回ここへ来る。
  */
+/**
+ * words から語を引く。deck 側は "Earth" "DNA" のように大文字始まりで、words は小文字で登録されていることがある
+ * (逆に略語は "PhD" のように大文字のまま登録されている)。元の表記と小文字の両方で引き、
+ * dictionary_cache がある行を優先する (同点なら元の表記)。Supabase を読むだけで外部 API は呼ばない。
+ */
+async function findWordRow(
+  supabase: ReturnType<typeof getSupabase>,
+  word: string,
+): Promise<{ id: string } | null> {
+  const lower = word.toLowerCase()
+  const candidates = lower === word ? [word] : [word, lower]
+  const { data, error } = await supabase
+    .from("words")
+    .select("id, word, dictionary_cache(word_id)")
+    .in("word", candidates)
+    .limit(candidates.length)
+  if (error || !data) return null
+  type Row = { id: string; word: string; dictionary_cache: unknown }
+  const rows = data as Row[]
+  const hasCache = (r: Row) =>
+    Array.isArray(r.dictionary_cache) ? r.dictionary_cache.length > 0 : Boolean(r.dictionary_cache)
+  const ranked = [...rows].sort((a, b) => {
+    const cache = Number(hasCache(b)) - Number(hasCache(a))
+    if (cache !== 0) return cache
+    return Number(b.word === word) - Number(a.word === word)
+  })
+  return ranked[0] ? { id: ranked[0].id } : null
+}
+
 async function handleResolve(c: Context, query: string) {
   try {
     if (!query || query.length > 100) {
@@ -218,11 +247,7 @@ app.post("/audio", rateLimit, async (c) => {
     const supabase = getSupabase()
 
     // words + dictionary_cache を同時取得
-    const { data: wordRow } = await supabase
-      .from("words")
-      .select("id")
-      .eq("word", word)
-      .maybeSingle()
+    const wordRow = await findWordRow(supabase, word)
 
     type CachePayload = {
       ipa?: string
@@ -316,11 +341,7 @@ app.post("/audio/word/example", async (c) => {
     const supabase = getSupabase()
     const supabaseUrl = process.env.SUPABASE_URL!
 
-    const { data: wordRow } = await supabase
-      .from("words")
-      .select("id")
-      .eq("word", word)
-      .maybeSingle()
+    const wordRow = await findWordRow(supabase, word)
 
     if (!wordRow?.id) {
       return c.json({ ok: false, reason: "WORD_NOT_FOUND" }, 404)
