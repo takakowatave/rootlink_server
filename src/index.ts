@@ -361,16 +361,24 @@ app.post("/audio/word/example", async (c) => {
     // クライアントから本文は受け取らず、必ず DB から引く (任意テキスト TTS 経路を作らない)。
     let deckExample: string | undefined
     if (deckId) {
-      const { data: deckRow } = await supabase
+      const { data: deckRows } = await supabase
         .from("deck_words")
         .select("example, pinned_sense_id")
         .eq("deck_id", deckId)
         .eq("word", word)
-        .maybeSingle()
-      const row = deckRow as { example?: string | null; pinned_sense_id?: string | null } | null
-      // pinned_sense_id が未設定でも override 自体は適用する (first-sense に当たるため)。
-      // 不一致 (別の senseId がピン留めされている) なら override は使わない。
-      const senseMatches = !row?.pinned_sense_id || row.pinned_sense_id === senseId
+        .order("position", { ascending: true })
+        .limit(1)
+      const row = ((deckRows ?? [])[0] ?? null) as { example?: string | null; pinned_sense_id?: string | null } | null
+      // 画面側 (applyDeckOverridesToDictionary) と同じ規則で override 対象の sense を決める。
+      // pinned_sense_id があればそれ、なければ senseGroups の先頭 sense。それ以外の sense には適用しない。
+      let targetSenseId: string | undefined = row?.pinned_sense_id ?? undefined
+      if (!targetSenseId) {
+        for (const group of payload.senseGroups ?? []) {
+          const first = (group.senses ?? [])[0]
+          if (first?.senseId) { targetSenseId = String(first.senseId); break }
+        }
+      }
+      const senseMatches = targetSenseId === senseId
       if (row?.example && senseMatches) {
         deckExample = row.example.trim()
       }
