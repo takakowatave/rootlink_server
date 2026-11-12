@@ -20,11 +20,16 @@ import { getSupabase } from "./supabase.js"
  */
 
 /** TTS 本体を呼ぶ前に通すゲートが面倒を見るテキスト種別。 */
-export type TtsBudgetKind = "word_example"
+export type TtsBudgetKind = "word_example" | "narration"
 
-/** 1 日あたりの OpenAI 呼び出し上限。word_example は 1,500/day。 */
+/**
+ * 1 日あたりの OpenAI 呼び出し上限。
+ * - word_example: ユーザー再生起点なので 1,500/day
+ * - narration: 管理者手動運用、1 動画 100〜200 行想定なので 500/day
+ */
 export const TTS_DAILY_LIMITS: Record<TtsBudgetKind, number> = {
   word_example: 1500,
+  narration: 500,
 }
 
 /** 失敗した hash を再試行してよくなるまでの待機時間。 */

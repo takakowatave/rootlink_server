@@ -13,6 +13,7 @@ import {
   generatePhraseHeadwordTTS,
   generateWordExampleTTS,
   generateWordExampleTTSByText,
+  generateNarrationTTS,
   storageObjectExists,
 } from "./lib/generateTTS.js";
 import {
@@ -470,6 +471,74 @@ app.post("/audio/word/example", async (c) => {
     return c.json({ ok: true, audioUrl })
   } catch (error) {
     console.error("AUDIO WORD EXAMPLE HANDLER FAILED:", error)
+    return c.json({ ok: false, reason: "INTERNAL_ERROR" }, 500)
+  }
+})
+
+/* =========================
+ * 5a-2. Audio for admin narration (Cuppa 長尺動画用)
+ * =========================
+ * - 認証: Supabase Bearer access_token + ADMIN_EMAILS (env, カンマ区切り) に含まれるメールのみ
+ * - 予算: tts_daily_counters.kind='narration' (500/day)
+ * - 保存: word-audio bucket に narration_<hash>.mp3 (voice/instructions/text の合成 hash)
+ * - 返却: { ok, audioUrl } (既存の /audio/* と同じ形)
+ */
+app.post("/audio/narration", async (c) => {
+  try {
+    const supabaseUrl = process.env.SUPABASE_URL!
+    const adminEmailsRaw = process.env.ADMIN_EMAILS ?? ""
+    const adminEmails = adminEmailsRaw.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean)
+    if (adminEmails.length === 0) {
+      return c.json({ ok: false, reason: "ADMIN_EMAILS_NOT_CONFIGURED" }, 500)
+    }
+
+    const token = c.req.header("Authorization")?.replace("Bearer ", "")
+    if (!token) return c.json({ ok: false, reason: "UNAUTHENTICATED" }, 401)
+    const supabase = getSupabase()
+    const { data: authData } = await supabase.auth.getUser(token)
+    const email = authData?.user?.email?.toLowerCase()
+    if (!email || !adminEmails.includes(email)) {
+      return c.json({ ok: false, reason: "NOT_ADMIN" }, 403)
+    }
+
+    const body = (await c.req.json().catch(() => ({}))) as {
+      text?: unknown
+      voice?: unknown
+      instructions?: unknown
+    }
+    const text = typeof body.text === "string" ? body.text.trim() : ""
+    const voice = typeof body.voice === "string" ? body.voice : "shimmer"
+    const instructions = typeof body.instructions === "string" ? body.instructions.slice(0, 2000) : ""
+
+    if (!text) return c.json({ ok: false, reason: "EMPTY_TEXT" }, 400)
+    if (text.length > 2000) return c.json({ ok: false, reason: "TEXT_TOO_LONG" }, 400)
+
+    // 同じ voice + instructions + text は Storage にキャッシュ共有させる。
+    const textHash = hashExampleText(`${voice}::${instructions}::${text}`)
+
+    // 既にあれば budget を消費せずに URL だけ返す (/audio/word/example と同じ方針)
+    const storagePath = `narration_${textHash}.mp3`
+    if (await storageObjectExists("word-audio", storagePath)) {
+      const audioUrl = `${supabaseUrl}/storage/v1/object/public/word-audio/${storagePath}`
+      return c.json({ ok: true, audioUrl, cached: true })
+    }
+
+    const decision = await reserveTtsCall("narration", textHash)
+    if (!decision.ok) {
+      const status = decision.reason === "DAILY_BUDGET_EXCEEDED" ? 429 : 503
+      return c.json({ ok: false, reason: decision.reason }, status)
+    }
+
+    const audioPath = await generateNarrationTTS(textHash, text, voice, instructions)
+    if (!audioPath) {
+      await recordTtsFailure(textHash, "NARRATION_TTS_FAILED")
+      return c.json({ ok: false, reason: "TTS_FAILED" }, 500)
+    }
+
+    const audioUrl = `${supabaseUrl}/storage/v1/object/public/${audioPath}`
+    return c.json({ ok: true, audioUrl })
+  } catch (error) {
+    console.error("AUDIO NARRATION HANDLER FAILED:", error)
     return c.json({ ok: false, reason: "INTERNAL_ERROR" }, 500)
   }
 })
