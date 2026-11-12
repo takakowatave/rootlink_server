@@ -199,6 +199,7 @@ export async function generateNarrationTTS(
   text: string,
   voice: string,
   instructions: string,
+  speed?: number,
 ): Promise<string | null> {
   const storagePath = `narration_${textHash}.mp3`
   const audioPath = `${WORD_BUCKET}/${storagePath}`
@@ -216,6 +217,7 @@ export async function generateNarrationTTS(
       storagePath,
       audioPath,
       voice,
+      speed,
     }),
   )
 }
@@ -257,9 +259,13 @@ type RunTTSArgs = {
   audioPath: string
   /** 省略時は shimmer (既存の word/phrase 音声の既定値を維持)。 */
   voice?: string
+  /** 省略時は gpt-4o-mini-tts。tts-1 / tts-1-hd も指定可。 */
+  model?: string
+  /** 0.25〜4.0。省略時 1.0 (API default)。 */
+  speed?: number
 }
 
-async function runTTS({ input, instructions, bucket, storagePath, audioPath, voice }: RunTTSArgs): Promise<string | null> {
+async function runTTS({ input, instructions, bucket, storagePath, audioPath, voice, model, speed }: RunTTSArgs): Promise<string | null> {
   try {
     const apiKey = process.env.OPENAI_API_KEY
     if (!apiKey) {
@@ -274,11 +280,12 @@ async function runTTS({ input, instructions, bucket, storagePath, audioPath, voi
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "gpt-4o-mini-tts",
+        model: model ?? "gpt-4o-mini-tts",
         input,
         voice: voice ?? "shimmer",
         instructions,
         response_format: "mp3",
+        ...(typeof speed === "number" ? { speed } : {}),
       }),
     })
 

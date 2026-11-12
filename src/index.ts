@@ -505,16 +505,20 @@ app.post("/audio/narration", async (c) => {
       text?: unknown
       voice?: unknown
       instructions?: unknown
+      speed?: unknown
     }
     const text = typeof body.text === "string" ? body.text.trim() : ""
     const voice = typeof body.voice === "string" ? body.voice : "shimmer"
     const instructions = typeof body.instructions === "string" ? body.instructions.slice(0, 2000) : ""
+    // OpenAI 仕様: 0.25〜4.0。安全のため 0.5〜2.0 に絞る。
+    const speedRaw = typeof body.speed === "number" ? body.speed : 1.0
+    const speed = Math.max(0.5, Math.min(2.0, speedRaw))
 
     if (!text) return c.json({ ok: false, reason: "EMPTY_TEXT" }, 400)
     if (text.length > 2000) return c.json({ ok: false, reason: "TEXT_TOO_LONG" }, 400)
 
-    // 同じ voice + instructions + text は Storage にキャッシュ共有させる。
-    const textHash = hashExampleText(`${voice}::${instructions}::${text}`)
+    // 同じ voice + instructions + speed + text は Storage にキャッシュ共有させる。
+    const textHash = hashExampleText(`${voice}::${speed}::${instructions}::${text}`)
 
     // 既にあれば budget を消費せずに URL だけ返す (/audio/word/example と同じ方針)
     const storagePath = `narration_${textHash}.mp3`
@@ -529,7 +533,7 @@ app.post("/audio/narration", async (c) => {
       return c.json({ ok: false, reason: decision.reason }, status)
     }
 
-    const audioPath = await generateNarrationTTS(textHash, text, voice, instructions)
+    const audioPath = await generateNarrationTTS(textHash, text, voice, instructions, speed)
     if (!audioPath) {
       await recordTtsFailure(textHash, "NARRATION_TTS_FAILED")
       return c.json({ ok: false, reason: "TTS_FAILED" }, 500)
