@@ -7,6 +7,23 @@ const GENERIC_WORD_INSTRUCTIONS = (word: string) =>
   `Say only the English word '${word}' in a natural British accent. Speak as one continuous word. Never spell out any letter. Do not say any other word.`
 
 /**
+ * 例文および短いフレーズ（ピリオドのない断片を含む）の読み上げ用 instructions。
+ *
+ * 2026-11-12 修正: "a ferocious beast" のようにピリオドのない短いフレーズで、
+ * 冠詞 a がアルファベット読み（/eɪ/）されていた。原因は旧 instructions が
+ * 「文として読む」としか指定しておらず、機能語の弱形を指定していなかったこと。
+ * 対策として、断片でも自然な発話として読むこと、機能語を弱く読むこと、
+ * アルファベット読み禁止を明記する。
+ */
+const SENTENCE_TTS_INSTRUCTIONS = [
+  "This is an example sentence or a short phrase from an English vocabulary book. It may be a fragment without a period.",
+  "Read it as a connected, natural utterance — not as a list of words or letters.",
+  "Pronounce function words in their weak forms: a as /ə/, an as /ən/, the as /ðə/, and also keep to, of, for, and and unstressed.",
+  "Never pronounce the article 'a' or any single-letter word as a letter of the alphabet. Never spell out any word.",
+  "Use a natural, clear British English accent with natural intonation and pacing.",
+].join(" ")
+
+/**
  * IPA から発音 instructions を gpt-4o-mini で1文生成する。
  *
  * 2026-09-16 事故: 旧プロンプトが「rhymes with 'writer'」のように
@@ -115,20 +132,16 @@ export async function generatePhraseTTS(
     return audioPath
   }
 
-  const instructions = `Read the following English sentence in a natural, clear British English accent. Speak it as a whole sentence with natural intonation and pacing — not word by word.`
-
   return withInFlight(audioPath, () =>
     runTTS({
       input: exampleText,
-      instructions,
+      instructions: SENTENCE_TTS_INSTRUCTIONS,
       bucket: PHRASE_BUCKET,
       storagePath,
       audioPath,
     }),
   )
 }
-
-const EXAMPLE_TTS_INSTRUCTIONS = `Read the following English sentence in a natural, clear British English accent. Speak it as a whole sentence with natural intonation and pacing — not word by word.`
 
 /**
  * 単語の sense 例文の mp3 を legacy パス (`example_${senseId}.mp3`) に生成する。
@@ -152,7 +165,7 @@ export async function generateWordExampleTTS(
   return withInFlight(audioPath, () =>
     runTTS({
       input: exampleText,
-      instructions: EXAMPLE_TTS_INSTRUCTIONS,
+      instructions: SENTENCE_TTS_INSTRUCTIONS,
       bucket: WORD_BUCKET,
       storagePath,
       audioPath,
@@ -180,7 +193,7 @@ export async function generateWordExampleTTSByText(
   return withInFlight(audioPath, () =>
     runTTS({
       input: exampleText,
-      instructions: EXAMPLE_TTS_INSTRUCTIONS,
+      instructions: SENTENCE_TTS_INSTRUCTIONS,
       bucket: WORD_BUCKET,
       storagePath,
       audioPath,
@@ -238,12 +251,10 @@ export async function generatePhraseHeadwordTTS(
     return audioPath
   }
 
-  const instructions = `Speak the following English phrase clearly in a British English accent. Say it as one natural chunk — not word by word.`
-
   return withInFlight(audioPath, () =>
     runTTS({
       input: phraseText,
-      instructions,
+      instructions: SENTENCE_TTS_INSTRUCTIONS,
       bucket: PHRASE_BUCKET,
       storagePath,
       audioPath,
