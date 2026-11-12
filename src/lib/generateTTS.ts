@@ -189,6 +189,38 @@ export async function generateWordExampleTTSByText(
 }
 
 /**
+ * Cuppa English 長尺動画用のナレーション mp3 を生成する。
+ * word-audio bucket を共有し、ファイル名は `narration_${textHash}.mp3`。
+ * textHash は呼び出し側で (voice + instructions + text) から作る想定。
+ * 既存があればスキップ (同じ voice + 指示 + 原稿なら再利用)。
+ */
+export async function generateNarrationTTS(
+  textHash: string,
+  text: string,
+  voice: string,
+  instructions: string,
+): Promise<string | null> {
+  const storagePath = `narration_${textHash}.mp3`
+  const audioPath = `${WORD_BUCKET}/${storagePath}`
+
+  if (await storageObjectExists(WORD_BUCKET, storagePath)) {
+    console.log("TTS SKIP (exists):", audioPath)
+    return audioPath
+  }
+
+  return withInFlight(audioPath, () =>
+    runTTS({
+      input: text,
+      instructions,
+      bucket: WORD_BUCKET,
+      storagePath,
+      audioPath,
+      voice,
+    }),
+  )
+}
+
+/**
  * phrase 見出し（タイトル）の mp3 を生成し phrase-audio bucket に保存する。
  * ファイル名は `${phrase_card_id}_headword.mp3` 固定。既存があればスキップ。
  */
@@ -223,9 +255,11 @@ type RunTTSArgs = {
   bucket: string
   storagePath: string
   audioPath: string
+  /** 省略時は shimmer (既存の word/phrase 音声の既定値を維持)。 */
+  voice?: string
 }
 
-async function runTTS({ input, instructions, bucket, storagePath, audioPath }: RunTTSArgs): Promise<string | null> {
+async function runTTS({ input, instructions, bucket, storagePath, audioPath, voice }: RunTTSArgs): Promise<string | null> {
   try {
     const apiKey = process.env.OPENAI_API_KEY
     if (!apiKey) {
@@ -242,7 +276,7 @@ async function runTTS({ input, instructions, bucket, storagePath, audioPath }: R
       body: JSON.stringify({
         model: "gpt-4o-mini-tts",
         input,
-        voice: "shimmer",
+        voice: voice ?? "shimmer",
         instructions,
         response_format: "mp3",
       }),
